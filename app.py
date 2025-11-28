@@ -1,6 +1,6 @@
 """
 Linear to Notion Sync
-Automates posting Linear Project Updates to Notion pages via webhooks.
+Automates posting Linear Project Updates to Notion pages via webhooks. Also updates the Contact property with the author of the update.
 """
 
 import os
