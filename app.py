@@ -7,6 +7,8 @@ import os
 import hmac
 import hashlib
 import time
+import json
+import re
 import requests
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, abort
@@ -19,6 +21,26 @@ try:
 except ImportError:
     NGROK_AVAILABLE = False
 
+# Optional OpenAI and Pydantic imports
+OPENAI_AVAILABLE = False
+PYDANTIC_AVAILABLE = False
+try:
+    import openai  # type: ignore
+    OPENAI_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from pydantic import BaseModel  # type: ignore
+    from typing import Optional, List, Union  # type: ignore
+    PYDANTIC_AVAILABLE = True
+except ImportError:
+    BaseModel = None  # type: ignore
+    Optional = None  # type: ignore
+    List = None  # type: ignore
+    Union = None  # type: ignore
+    PYDANTIC_AVAILABLE = False
+
 # Load environment variables
 load_dotenv()
 
@@ -29,6 +51,8 @@ NOTION_DATABASE_ID = os.getenv('NOTION_DATABASE_ID')
 LINEAR_WEBHOOK_SECRET = os.getenv('LINEAR_WEBHOOK_SECRET', '')
 USE_NGROK = os.getenv('USE_NGROK', 'false').lower() == 'true'
 NGROK_AUTH_TOKEN = os.getenv('NGROK_AUTH_TOKEN', '')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
 
 # API endpoints
 LINEAR_API_URL = 'https://api.linear.app/graphql'
@@ -73,6 +97,73 @@ def get_team_name(team_id):
         print(f"Error fetching team name: {e}")
     
     return "Unknown Team"
+
+
+def get_project_teams(project_id):
+    """
+    Fetch project details including teams from Linear using GraphQL API.
+    Returns a list of team names.
+    """
+    if not LINEAR_API_KEY:
+        print("   ⚠️  LINEAR_API_KEY not set, cannot fetch project teams")
+        return []
+    
+    headers = {
+        'Authorization': LINEAR_API_KEY,
+        'Content-Type': 'application/json',
+    }
+    
+    query = """
+    query($id: String!) {
+      project(id: $id) {
+        id
+        name
+        teams {
+          nodes {
+            id
+            name
+          }
+        }
+      }
+    }
+    """
+    
+    try:
+        print(f"   🔍 Fetching project teams from Linear API for project: {project_id}")
+        response = requests.post(
+            LINEAR_API_URL,
+            json={'query': query, 'variables': {'id': project_id}},
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            project = data.get('data', {}).get('project', {})
+            
+            if not project:
+                print(f"   ⚠️  Project not found: {project_id}")
+                return []
+            
+            team_names = []
+            
+            # Check for multiple teams (teams.nodes)
+            teams = project.get('teams', {}).get('nodes', [])
+            if teams:
+                team_names = [team.get('name') for team in teams if team.get('name')]
+                print(f"   ✅ Found {len(team_names)} team(s): {', '.join(team_names)}")
+            else:
+                print(f"   ⚠️  No teams found for project")
+            
+            return team_names
+        else:
+            print(f"   ⚠️  Error fetching project: {response.status_code}")
+            print(f"   Response: {response.text}")
+            return []
+    except Exception as e:
+        print(f"   ❌ Exception fetching project teams: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 
 def find_notion_user_by_name(contact_name, headers):
@@ -457,6 +548,428 @@ def find_or_create_notion_document(team_name, date_str, contact_name=None):
         return None
 
 
+# Pydantic models for Notion blocks
+# Define these conditionally to avoid errors if Pydantic is not available
+NotionBlocksResponse = None  # type: ignore
+if PYDANTIC_AVAILABLE and BaseModel is not None:
+    from typing import Any, Dict  # type: ignore
+    from pydantic import ConfigDict  # type: ignore
+    
+    # Define a flexible block model that can handle different block types
+    # OpenAI's structured output requires additionalProperties: false
+    # So we explicitly define all possible block type fields as optional
+    class NotionBlock(BaseModel):  # type: ignore
+        object: str = "block"
+        type: str
+        # Define all possible block type fields as optional
+        paragraph: Optional[Dict[str, Any]] = None  # type: ignore
+        embed: Optional[Dict[str, Any]] = None  # type: ignore
+        heading_1: Optional[Dict[str, Any]] = None  # type: ignore
+        heading_2: Optional[Dict[str, Any]] = None  # type: ignore
+        heading_3: Optional[Dict[str, Any]] = None  # type: ignore
+        bulleted_list_item: Optional[Dict[str, Any]] = None  # type: ignore
+        numbered_list_item: Optional[Dict[str, Any]] = None  # type: ignore
+        # Forbid extra properties to satisfy OpenAI's requirement
+        model_config = ConfigDict(extra="forbid")
+    
+    class NotionBlocksResponse(BaseModel):  # type: ignore
+        blocks: List[NotionBlock]  # type: ignore
+
+
+def convert_content_with_llm(update_body):
+    """
+    Use OpenAI LLM to convert Linear project update content into Notion-compatible format.
+    Returns a list of Notion block objects, or None if the LLM call fails.
+    """
+    if not OPENAI_AVAILABLE:
+        print("   ⚠️  OpenAI library not available")
+        return None
+
+    if not OPENAI_API_KEY:
+        print("   ⚠️  OPENAI_API_KEY not set")
+        return None
+
+    if not update_body or not update_body.strip():
+        return None
+
+    try:
+        print("   🤖 Using LLM to convert content to Notion format...")
+
+        # Initialize OpenAI client
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)  # type: ignore
+
+        # Prompt for the LLM – we ask explicitly for JSON with { "blocks": [...] }
+        prompt = f"""Convert the following Linear project update content into Notion-compatible format.
+
+The content may contain:
+- Plain text
+- URLs/links (including Linear, Loom, YouTube, etc.)
+- Markdown formatting
+- Lists
+- Other formatting
+
+Return a JSON object with the following shape, and NOTHING else:
+
+{{
+  "blocks": [
+    {{
+      "object": "block",
+      "type": "paragraph" | "embed" | "heading_1" | "heading_2" | "heading_3" | "bulleted_list_item" | "numbered_list_item",
+      "<type-specific-key>": {{
+        // Notion's API-compatible payload
+      }}
+    }},
+    ...
+  ]
+}}
+
+Guidelines:
+- Use "paragraph" blocks for normal text.
+
+- For ANY URL whose domain contains "linear.app", include it as an inline link within paragraph text using rich_text with link annotations:
+  {{
+    "type": "text",
+    "text": {{
+      "content": "Link text or URL",
+      "link": {{
+        "url": "https://linear.app/..."
+      }}
+    }}
+  }}
+
+- Place Linear URLs inline within paragraph blocks, not as separate embed blocks.
+
+- Use "embed" blocks for video URLs (Loom, YouTube, Vimeo, etc.) in the same way:
+  {{
+    "object": "block",
+    "type": "embed",
+    "embed": {{
+      "url": "https://..."
+    }}
+  }}
+
+- For other inline links in text, use rich_text with link annotations.
+
+- Preserve the structure and meaning of the original content.
+
+- Make sure the JSON is valid and parsable.
+
+Content to convert:
+{update_body}
+"""
+
+        completion = client.chat.completions.create(  # type: ignore
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that converts text content into Notion API block format. Always respond with a single valid JSON object."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            # Ask the model to respond with a JSON object
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+
+        content = completion.choices[0].message.content
+        if not content:
+            print("   ⚠️  LLM returned empty content")
+            return None
+
+        try:
+            response_data = json.loads(content)
+        except json.JSONDecodeError as e:
+            print(f"   ⚠️  Failed to parse LLM JSON: {e}")
+            print(f"   Raw content: {content[:400]}...")
+            return None
+
+        blocks = response_data.get("blocks") or []
+        if not isinstance(blocks, list) or not blocks:
+            print("   ⚠️  LLM returned no blocks or blocks is not a list")
+            return None
+
+        # Normalize / ensure required fields
+        normalized_blocks = []
+        for i, block in enumerate(blocks):
+            try:
+                if not isinstance(block, dict):
+                    print(f"   ⚠️  Block {i} is not a dict: {type(block)}, skipping")
+                    continue
+
+                block_dict = dict(block)
+
+                if "object" not in block_dict:
+                    block_dict["object"] = "block"
+                if "type" not in block_dict:
+                    block_dict["type"] = "paragraph"
+
+                # Ensure embed blocks have the correct Notion shape
+                if block_dict["type"] == "embed":
+                    # Case 1: model put the URL directly as "url" on the block
+                    if "embed" not in block_dict:
+                        url = block_dict.get("url")
+                        if url:
+                            block_dict["embed"] = {"url": url}
+                            block_dict.pop("url", None)
+                    # Case 2: model returned "embed": "https://linear.app/..."
+                    elif isinstance(block_dict["embed"], str):
+                        block_dict["embed"] = {"url": block_dict["embed"]}
+                
+                # Ensure paragraph blocks have the correct Notion shape
+                if block_dict["type"] == "paragraph":
+                    if "paragraph" not in block_dict:
+                        block_dict["paragraph"] = {}
+                    
+                    # Check if LLM used "text" instead of "rich_text" (common mistake)
+                    if "text" in block_dict["paragraph"]:
+                        # Convert "text" to "rich_text"
+                        text_value = block_dict["paragraph"].pop("text")
+                        if isinstance(text_value, list):
+                            block_dict["paragraph"]["rich_text"] = text_value
+                        else:
+                            # If it's not a list, wrap it
+                            block_dict["paragraph"]["rich_text"] = [text_value] if text_value else []
+                    
+                    if "rich_text" not in block_dict["paragraph"]:
+                        # If rich_text is missing, create an empty array
+                        block_dict["paragraph"]["rich_text"] = []
+                    # Ensure rich_text is a list
+                    elif not isinstance(block_dict["paragraph"]["rich_text"], list):
+                        # If it's not a list, wrap it or create empty
+                        block_dict["paragraph"]["rich_text"] = []
+                    else:
+                        # Normalize rich_text items to ensure correct structure
+                        normalized_rich_text = []
+                        for rt_item in block_dict["paragraph"]["rich_text"]:
+                            if isinstance(rt_item, dict):
+                                # If text field is a string, convert it to object
+                                if "text" in rt_item and isinstance(rt_item["text"], str):
+                                    rt_item = {
+                                        "type": rt_item.get("type", "text"),
+                                        "text": {
+                                            "content": rt_item["text"]
+                                        }
+                                    }
+                                # NEW: always move top-level "link" into text.link, if possible
+                                if "link" in rt_item:
+                                    link_val = rt_item.pop("link")
+                                    if isinstance(rt_item.get("text"), dict):
+                                        rt_item["text"]["link"] = link_val
+                                
+                                # Ensure type is set
+                                if "type" not in rt_item:
+                                    rt_item["type"] = "text"
+                                normalized_rich_text.append(rt_item)
+                            elif isinstance(rt_item, str):
+                                # If it's just a string, convert to proper rich_text format
+                                normalized_rich_text.append({
+                                    "type": "text",
+                                    "text": {
+                                        "content": rt_item
+                                    }
+                                })
+                        block_dict["paragraph"]["rich_text"] = normalized_rich_text
+                
+                # Ensure heading blocks have the correct Notion shape
+                if block_dict["type"] in ["heading_1", "heading_2", "heading_3"]:
+                    heading_key = block_dict["type"]
+                    if heading_key not in block_dict:
+                        block_dict[heading_key] = {}
+                    if "rich_text" not in block_dict[heading_key]:
+                        block_dict[heading_key]["rich_text"] = []
+                    elif not isinstance(block_dict[heading_key]["rich_text"], list):
+                        block_dict[heading_key]["rich_text"] = []
+                    else:
+                        # Normalize rich_text items (same as paragraph)
+                        normalized_rich_text = []
+                        for rt_item in block_dict[heading_key]["rich_text"]:
+                            if isinstance(rt_item, dict):
+                                if "text" in rt_item and isinstance(rt_item["text"], str):
+                                    rt_item = {
+                                        "type": rt_item.get("type", "text"),
+                                        "text": {
+                                            "content": rt_item["text"]
+                                        }
+                                    }
+                                # NEW: move top-level link into text.link
+                                if "link" in rt_item:
+                                    link_val = rt_item.pop("link")
+                                    if isinstance(rt_item.get("text"), dict):
+                                        rt_item["text"]["link"] = link_val
+                                
+                                if "type" not in rt_item:
+                                    rt_item["type"] = "text"
+                                normalized_rich_text.append(rt_item)
+                            elif isinstance(rt_item, str):
+                                normalized_rich_text.append({
+                                    "type": "text",
+                                    "text": {
+                                        "content": rt_item
+                                    }
+                                })
+                        block_dict[heading_key]["rich_text"] = normalized_rich_text
+                
+                # Ensure list item blocks have the correct Notion shape
+                if block_dict["type"] in ["bulleted_list_item", "numbered_list_item"]:
+                    list_key = block_dict["type"]
+                    if list_key not in block_dict:
+                        block_dict[list_key] = {}
+                    
+                    # NEW: convert "text" -> "rich_text" and remove "text"
+                    if "text" in block_dict[list_key]:
+                        text_value = block_dict[list_key].pop("text")
+                        if isinstance(text_value, list):
+                            block_dict[list_key]["rich_text"] = text_value
+                        else:
+                            block_dict[list_key]["rich_text"] = [text_value] if text_value else []
+                    
+                    if "rich_text" not in block_dict[list_key]:
+                        block_dict[list_key]["rich_text"] = []
+                    elif not isinstance(block_dict[list_key]["rich_text"], list):
+                        block_dict[list_key]["rich_text"] = []
+                    else:
+                        # Normalize rich_text items (same as paragraph)
+                        normalized_rich_text = []
+                        for rt_item in block_dict[list_key]["rich_text"]:
+                            if isinstance(rt_item, dict):
+                                # If text field is a string, convert it to object
+                                if "text" in rt_item and isinstance(rt_item["text"], str):
+                                    rt_item = {
+                                        "type": rt_item.get("type", "text"),
+                                        "text": {
+                                            "content": rt_item["text"]
+                                        }
+                                    }
+                                # NEW: move top-level link into text.link
+                                if "link" in rt_item:
+                                    link_val = rt_item.pop("link")
+                                    if isinstance(rt_item.get("text"), dict):
+                                        rt_item["text"]["link"] = link_val
+                                
+                                if "type" not in rt_item:
+                                    rt_item["type"] = "text"
+                                normalized_rich_text.append(rt_item)
+                            elif isinstance(rt_item, str):
+                                normalized_rich_text.append({
+                                    "type": "text",
+                                    "text": {
+                                        "content": rt_item
+                                    }
+                                })
+                        block_dict[list_key]["rich_text"] = normalized_rich_text
+
+                normalized_blocks.append(block_dict)
+            except Exception as e:
+                print(f"   ⚠️  Error normalizing block {i}: {e}")
+                import traceback
+                traceback.print_exc()
+                # Skip this block and continue
+                continue
+
+        if not normalized_blocks:
+            print("   ⚠️  LLM returned no valid blocks after normalization")
+            return None
+
+        print(f"   ✅ LLM converted content into {len(normalized_blocks)} block(s)")
+        return normalized_blocks
+
+    except Exception as e:
+        print(f"   ⚠️  LLM conversion failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def convert_content_with_fallback(update_body):
+    """
+    Fallback function to convert content by detecting and properly formatting links.
+    Returns a list of Notion block objects.
+    """
+    if not update_body or not update_body.strip():
+        return []
+    
+    print("   📝 Using fallback script to handle links...")
+    
+    # Pattern to detect URLs
+    url_pattern = r'https?://[^\s\)\]\}]+'
+    
+    # Find all URLs in the text
+    urls = []
+    for match in re.finditer(url_pattern, update_body):
+        url = match.group(0)
+        # Remove trailing punctuation
+        url = url.rstrip('.,;:!?)')
+        urls.append((match.start(), match.start() + len(url), url))
+    
+    if not urls:
+        # No URLs found, return simple paragraph
+        return [{
+            'object': 'block',
+            'type': 'paragraph',
+            'paragraph': {
+                'rich_text': [{
+                    'type': 'text',
+                    'text': {
+                        'content': update_body
+                    }
+                }]
+            }
+        }]
+    
+    # Build rich_text array with links
+    rich_text = []
+    last_end = 0
+    
+    for start, end, url in urls:
+        # Add text before the URL
+        if start > last_end:
+            text_segment = update_body[last_end:start]
+            if text_segment:
+                rich_text.append({
+                    'type': 'text',
+                    'text': {
+                        'content': text_segment
+                    }
+                })
+        
+        # Add the URL as a link
+        # Extract link text (could be the URL itself or text before it)
+        link_text = url
+        rich_text.append({
+            'type': 'text',
+            'text': {
+                'content': link_text,
+                'link': {
+                    'url': url
+                }
+            }
+        })
+        last_end = end
+    
+    # Add remaining text after the last URL
+    if last_end < len(update_body):
+        text_segment = update_body[last_end:]
+        if text_segment:
+            rich_text.append({
+                'type': 'text',
+                'text': {
+                    'content': text_segment
+                }
+            })
+    
+    return [{
+        'object': 'block',
+        'type': 'paragraph',
+        'paragraph': {
+            'rich_text': rich_text
+        }
+    }]
+
+
 def add_project_update_block(page_id, project_name, update_body, project_url=None):
     """
     Add a new block to a Notion page with project name as heading and update content.
@@ -483,6 +996,7 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
     if project_url:
         heading_text['text']['link'] = {'url': project_url}
 
+    # Start with the heading block
     blocks = [
         {
             'object': 'block',
@@ -492,26 +1006,70 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
                     heading_text
                 ]
             }
-        },
-        {
-            'object': 'block',
-            'type': 'paragraph',
-            'paragraph': {
-                'rich_text': [
-                    {
-                        'type': 'text',
-                        'text': {
-                            'content': update_body
-                        }
-                    }
-                ]
-            }
         }
     ]
     
+    # Try to convert content using LLM, fallback to script-based approach if it fails
+    content_blocks = None
+    try:
+        if update_body:
+            content_blocks = convert_content_with_llm(update_body)
+            if content_blocks is None:
+                print("   ⚠️  LLM conversion failed, using fallback...")
+                content_blocks = convert_content_with_fallback(update_body)
+        
+        # Add content blocks
+        if content_blocks:
+            # Validate blocks before extending
+            if not isinstance(content_blocks, list):
+                print(f"   ⚠️  content_blocks is not a list: {type(content_blocks)}")
+                content_blocks = []
+            else:
+                # Validate each block is a dict
+                valid_blocks = []
+                for i, block in enumerate(content_blocks):
+                    if isinstance(block, dict):
+                        valid_blocks.append(block)
+                    else:
+                        print(f"   ⚠️  Block {i} is not a dict: {type(block)}, skipping")
+                content_blocks = valid_blocks
+            blocks.extend(content_blocks)
+        else:
+            # If no content blocks were created, add an empty paragraph
+            blocks.append({
+                'object': 'block',
+                'type': 'paragraph',
+                'paragraph': {
+                    'rich_text': []
+                }
+            })
+    except Exception as e:
+        print(f"   ❌ Error processing content blocks: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback to empty paragraph if content processing fails
+        blocks.append({
+            'object': 'block',
+            'type': 'paragraph',
+            'paragraph': {
+                'rich_text': []
+            }
+        })
+    
     print(f"   Adding blocks to page {page_id}")
     print(f"   Block 1: heading_2 with '{project_name}'")
-    print(f"   Block 2: paragraph with {len(update_body)} chars")
+    print(f"   Content blocks: {len(blocks) - 1}")
+    
+    # Debug check: ensure no top-level "link" in rich_text items
+    for i, b in enumerate(blocks):
+        t = b.get("type")
+        if t in ["paragraph", "bulleted_list_item", "numbered_list_item", "heading_1", "heading_2", "heading_3"]:
+            key = t if t.startswith("heading_") or t.endswith("_list_item") else "paragraph"
+            inner = b.get(key, {})
+            r = inner.get("rich_text", [])
+            for j, rt in enumerate(r):
+                if isinstance(rt, dict) and "link" in rt:
+                    print(f"   ⚠️ rich_text[{j}] in block {i} still has top-level 'link': {rt}")
     
     try:
         patch_url = f'{NOTION_API_URL}/blocks/{page_id}/children'
@@ -667,34 +1225,80 @@ def process_project_update_webhook(webhook_data):
             print("⚠️  Warning: Update body is empty")
         
         # Get team information
-        team = None
+        team_names = []
+        project_id = None
+        
+        # Try to get team information from webhook payload first
         if project:
-            team = project.get('team')
-            if not team and project.get('teamId'):
-                team_id = project.get('teamId')
-                team_name = get_team_name(team_id)
-            else:
-                team_name = team.get('name') if team else None
+            # Check for multiple teams
+            teams = project.get('teams', {}).get('nodes', [])
+            if teams:
+                team_names = [team.get('name') for team in teams if team.get('name')]
+            
+            # If no teams found, check for single team
+            if not team_names:
+                team = project.get('team')
+                if team:
+                    if isinstance(team, dict):
+                        team_name = team.get('name')
+                        if team_name:
+                            team_names = [team_name]
+                    else:
+                        # Team might be just an ID
+                        team_id = team if isinstance(team, str) else None
+                        if team_id:
+                            team_name = get_team_name(team_id)
+                            if team_name and team_name != "Unknown Team":
+                                team_names = [team_name]
+            
+            # Get project ID for API fallback
+            project_id = project.get('id')
         else:
             # Try to get team from projectUpdate directly
             team = project_update.get('team')
-            team_name = team.get('name') if team else None
-        
-        # If team name is still not available, try to fetch it via API
-        if not team_name:
-            team_id = None
             if team:
-                team_id = team.get('id')
-            elif project:
+                if isinstance(team, dict):
+                    team_name = team.get('name')
+                    if team_name:
+                        team_names = [team_name]
+                else:
+                    team_id = team if isinstance(team, str) else None
+                    if team_id:
+                        team_name = get_team_name(team_id)
+                        if team_name and team_name != "Unknown Team":
+                            team_names = [team_name]
+            
+            # Get project ID for API fallback
+            project_id = project_update.get('projectId') or project_update.get('project', {}).get('id')
+        
+        # If no team names found, try to fetch from Linear API using project ID
+        if not team_names and project_id:
+            print(f"   🔍 No team info in webhook payload, fetching from Linear API...")
+            team_names = get_project_teams(project_id)
+        
+        # If still no teams found, try to get team ID and fetch single team
+        if not team_names:
+            team_id = None
+            if project:
                 team_id = project.get('teamId')
             elif project_update.get('teamId'):
                 team_id = project_update.get('teamId')
             
             if team_id:
+                print(f"   🔍 Fetching single team by ID: {team_id}")
                 team_name = get_team_name(team_id)
+                if team_name and team_name != "Unknown Team":
+                    team_names = [team_name]
         
-        if not team_name:
-            team_name = "Unknown Team"
+        # Format team name(s) for document title
+        if team_names:
+            # If multiple teams, join them with " & "
+            team_name = " & ".join(team_names)
+            print(f"   ✅ Team(s): {team_name}")
+        else:
+            # If no teams found, use project name as fallback
+            team_name = project_name if project_name and project_name != "Unknown Project" else "Unknown Team"
+            print(f"   ⚠️  Could not determine team name, using project name: {team_name}")
         
         # Get current date in YYYY-MM-DD format
         date_str = datetime.now().strftime('%Y-%m-%d')
@@ -743,13 +1347,22 @@ def webhook_handler():
     """
     Handle Linear webhook requests with signature verification.
     """
-    print("\n" + "="*60)
-    print("📥 Webhook received at /webhook")
-    print(f"   Method: {request.method}")
-    print(f"   Headers: {dict(request.headers)}")
-    print(f"   Content-Type: {request.content_type}")
-    print(f"   Content-Length: {request.content_length}")
-    print("="*60)
+    import sys
+    import traceback
+    
+    try:
+        print("\n" + "="*60)
+        print("📥 Webhook received at /webhook")
+        print(f"   Method: {request.method}")
+        print(f"   Headers: {dict(request.headers)}")
+        print(f"   Content-Type: {request.content_type}")
+        print(f"   Content-Length: {request.content_length}")
+        print("="*60)
+    except Exception as e:
+        print(f"\n❌❌❌ ERROR IN WEBHOOK HANDLER START ❌❌❌")
+        print(f"Error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': 'Internal server error'}), 500
     
     try:
         # Verify signature BEFORE parsing JSON
@@ -768,6 +1381,13 @@ def webhook_handler():
         if not payload:
             print("❌ Invalid or empty payload")
             return jsonify({'error': 'Invalid payload'}), 400
+        
+        # Print the raw payload in a formatted way
+        print("\n" + "="*60)
+        print("📦 RAW WEBHOOK PAYLOAD:")
+        print("="*60)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        print("="*60 + "\n")
         
         print(f"📦 Payload keys: {list(payload.keys())}")
         print(f"📦 Payload type: {payload.get('type')}")
@@ -799,13 +1419,34 @@ def webhook_handler():
             return jsonify({'status': 'ignored'}), 200
             
     except Exception as e:
-        print(f"❌ Error handling webhook: {e}")
+        import sys
         import traceback
+        
+        error_msg = f"\n❌❌❌ ERROR HANDLING WEBHOOK ❌❌❌\n"
+        error_msg += f"Error type: {type(e).__name__}\n"
+        error_msg += f"Error message: {str(e)}\n"
+        error_msg += "\nFull traceback:\n"
+        
+        # Print to stdout
+        print(error_msg)
         traceback.print_exc()
+        print("="*60)
+        
+        # Also print to stderr to ensure it's visible
+        print(error_msg, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print("="*60, file=sys.stderr)
+        
+        # Force flush
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
         # Don't expose internal errors to potential attackers
         return jsonify({'error': 'Internal server error'}), 500
     finally:
         print("="*60 + "\n")
+        import sys
+        sys.stdout.flush()
 
 
 @app.route('/health', methods=['GET'])
