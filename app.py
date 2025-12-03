@@ -439,27 +439,38 @@ def update_contact_property(page_id, contact_name):
 
 def get_last_friday_of_week():
     """
-    Calculate the date of the last Friday of the current week.
+    Calculate the "Week ending on" date based on company rules.
     Returns the date as a datetime object.
-    - If today is Monday-Thursday: returns the upcoming Friday (this week)
-    - If today is Friday: returns today
-    - If today is Saturday-Sunday: returns the previous Friday (this week)
+    
+    Company rule: Updates are written on Friday, but teams can be late and 
+    continue adding/updating on Saturday, Sunday, and Monday. Those late 
+    updates should still use the previous Friday's date.
+    
+    - Friday, Saturday, Sunday, Monday: use the most recent Friday
+      (today if Friday, or previous Friday if Sat/Sun/Mon)
+    - Tuesday, Wednesday, Thursday: use the upcoming Friday (this week)
     """
     today = datetime.now()
     # Get the day of the week (Monday=0, Sunday=6)
     days_since_monday = today.weekday()
     
     # Friday is day 4 (0=Monday, 4=Friday, 6=Sunday)
-    if days_since_monday <= 4:
-        # Monday through Friday: calculate days until Friday
+    if days_since_monday == 0:
+        # Monday: go back to the previous Friday (3 days ago)
+        week_ending_friday = today - timedelta(days=3)
+    elif days_since_monday <= 3:
+        # Tuesday (1), Wednesday (2), Thursday (3): calculate days until Friday
         days_until_friday = 4 - days_since_monday
-        last_friday = today + timedelta(days=days_until_friday)
+        week_ending_friday = today + timedelta(days=days_until_friday)
+    elif days_since_monday == 4:
+        # Friday: use today
+        week_ending_friday = today
     else:
-        # Saturday or Sunday: go back to the previous Friday
+        # Saturday (5) or Sunday (6): go back to the previous Friday
         days_since_friday = days_since_monday - 4
-        last_friday = today - timedelta(days=days_since_friday)
+        week_ending_friday = today - timedelta(days=days_since_friday)
     
-    return last_friday
+    return week_ending_friday
 
 
 def update_week_ending_property(page_id, headers):
@@ -503,7 +514,8 @@ def update_week_ending_property(page_id, headers):
 
 def find_or_create_notion_document(team_name, date_str, contact_name=None):
     """
-    Find or create a Notion document with the format: "{{team}} Update @{{date}}"
+    Find or create a Notion document with the format: "{{team}} Update"
+    Searches by title AND "Week ending on" property to find existing documents.
     Returns the page ID if found or created, None otherwise.
     """
     if not NOTION_API_KEY or not NOTION_DATABASE_ID:
@@ -516,25 +528,39 @@ def find_or_create_notion_document(team_name, date_str, contact_name=None):
         'Notion-Version': '2022-06-28',
     }
     
-    document_title = f"{team_name} Update @{date_str}"
+    document_title = f"{team_name} Update"
     print(f"   Searching for document: '{document_title}'")
+    
+    # Calculate the week ending date (last Friday) for filtering
+    last_friday = get_last_friday_of_week()
+    week_ending_date = last_friday.strftime('%Y-%m-%d')
+    print(f"   Week ending on: {week_ending_date}")
     
     # First, try to find existing document by querying the database
     query_url = f'{NOTION_API_URL}/databases/{NOTION_DATABASE_ID}/query'
     print(f"   Query URL: {query_url}")
     
     try:
-        # Query database for existing document with matching title
-        # Note: Notion's title filter uses 'contains' or we can search all and filter client-side
+        # Query database for existing document with matching title AND week ending date
         print("   🔍 Querying Notion database...")
         query_response = requests.post(
             query_url,
             json={
                 'filter': {
-                    'property': 'Name',
-                    'title': {
-                        'equals': document_title
-                    }
+                    'and': [
+                        {
+                            'property': 'Name',
+                            'title': {
+                                'equals': document_title
+                            }
+                        },
+                        {
+                            'property': 'Week ending on',
+                            'date': {
+                                'equals': week_ending_date
+                            }
+                        }
+                    ]
                 },
                 'page_size': 1
             },
@@ -558,11 +584,6 @@ def find_or_create_notion_document(team_name, date_str, contact_name=None):
         
         # Document doesn't exist, create it
         print("   📝 Creating new Notion document...")
-        
-        # Calculate last Friday of the week
-        last_friday = get_last_friday_of_week()
-        week_ending_date = last_friday.strftime('%Y-%m-%d')
-        print(f"   Week ending on (last Friday): {week_ending_date}")
         
         page_data = {
             'parent': {'database_id': NOTION_DATABASE_ID},
@@ -1798,7 +1819,7 @@ def process_project_update_webhook(webhook_data):
         print(f"\n📄 Finding or creating Notion document...")
         print(f"   Team: {team_name}")
         print(f"   Date: {date_str}")
-        print(f"   Document title will be: '{team_name} Update @{date_str}'")
+        print(f"   Document title will be: '{team_name} Update'")
         
         page_id = find_or_create_notion_document(team_name, date_str, contact_name)
         
