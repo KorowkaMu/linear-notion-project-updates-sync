@@ -166,6 +166,74 @@ def get_project_teams(project_id):
         return []
 
 
+def get_project_status(project_id):
+    """
+    Fetch project status from Linear using GraphQL API.
+    Returns the project status string, or None if not found.
+    """
+    if not LINEAR_API_KEY:
+        print("   ⚠️  LINEAR_API_KEY not set, cannot fetch project status")
+        return None
+    
+    headers = {
+        'Authorization': LINEAR_API_KEY,
+        'Content-Type': 'application/json',
+    }
+    
+    query = """
+    query($id: String!) {
+      project(id: $id) {
+        id
+        name
+        status {
+          name
+          type
+        }
+      }
+    }
+    """
+    
+    try:
+        print(f"   🔍 Fetching project status from Linear API for project: {project_id}")
+        response = requests.post(
+            LINEAR_API_URL,
+            json={'query': query, 'variables': {'id': project_id}},
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            project = data.get('data', {}).get('project', {})
+            
+            if not project:
+                print(f"   ⚠️  Project not found: {project_id}")
+                return None
+            
+            status_obj = project.get('status')
+            if status_obj:
+                # Status is an object, get the name field
+                status = status_obj.get('name')
+                if status:
+                    print(f"   ✅ Found project status: {status}")
+                else:
+                    print(f"   ⚠️  Status object found but no name field: {status_obj}")
+                    return None
+            else:
+                print(f"   ⚠️  No status found for project")
+                return None
+            
+            return status
+        else:
+            print(f"   ⚠️  Error fetching project status: {response.status_code}")
+            print(f"   Response: {response.text}")
+            return None
+    except Exception as e:
+        print(f"   ❌ Exception fetching project status: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def find_notion_user_by_name(contact_name, headers):
     """
     Search for a Notion user by name or email.
@@ -1171,7 +1239,33 @@ def delete_blocks(block_ids, headers):
     return success_count == len(block_ids)
 
 
-def add_project_update_block(page_id, project_name, update_body, project_url=None, update_id=None, action='create'):
+def get_status_emoji(status):
+    """Get emoji for status."""
+    status_lower = (status or '').lower()
+    if status_lower == 'ontrack' or status_lower == 'on_track':
+        return '🟢'
+    elif status_lower == 'atrisk' or status_lower == 'at_risk':
+        return '🟡'
+    elif status_lower == 'offtrack' or status_lower == 'off_track':
+        return '🔴'
+    return '⚪'
+
+
+def format_status_text(status):
+    """Format status text for display (lowercase)."""
+    if not status:
+        return None
+    status_lower = status.lower()
+    if status_lower in ['ontrack', 'on_track']:
+        return 'on track'
+    elif status_lower in ['atrisk', 'at_risk']:
+        return 'at risk'
+    elif status_lower in ['offtrack', 'off_track']:
+        return 'off track'
+    return status.lower()
+
+
+def add_project_update_block(page_id, project_name, update_body, project_url=None, update_id=None, action='create', project_status=None, update_status=None):
     """
     Add a new block to a Notion page with project name as heading and update content.
     If action is 'update' and the update already exists, replace it.
@@ -1183,6 +1277,8 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
         project_url: Optional URL to the Linear project
         update_id: Optional Linear update ID for deduplication
         action: 'create' or 'update' - determines if we skip duplicates or replace them
+        project_status: Optional project status (onTrack, atRisk, offTrack)
+        update_status: Optional update status (onTrack, atRisk, offTrack)
     """
     if not NOTION_API_KEY:
         print("   ❌ Error: NOTION_API_KEY not set")
@@ -1194,18 +1290,21 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
         'Notion-Version': '2022-06-28',
     }
     
-    # Create blocks: heading with project name, then paragraph with update body
-    # Build heading rich text, optionally hyperlinking to the Linear project
-    heading_text = {
+    # Create blocks: heading with project name and status, then status indicator, then content
+    # Build heading rich text with project name and status
+    heading_parts = []
+    
+    # Add project name
+    project_name_text = {
         'type': 'text',
         'text': {
             'content': project_name
         }
     }
-
     if project_url:
-        heading_text['text']['link'] = {'url': project_url}
-
+        project_name_text['text']['link'] = {'url': project_url}
+    heading_parts.append(project_name_text)
+    
     # Start with a divider line before the heading for reliable deduplication
     # This divider serves as the start marker
     blocks = []
@@ -1222,11 +1321,120 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
         'object': 'block',
         'type': 'heading_2',
         'heading_2': {
-            'rich_text': [
-                heading_text
-            ]
+            'rich_text': heading_parts
         }
     })
+    
+    # Add combined project status and update health beneath the heading
+    # Format: icon + project status + ": " + update health
+    if project_status or update_status:
+        status_parts = []
+        
+        # Determine color based on update health
+        status_color = 'gray'
+        if update_status:
+            status_lower = (update_status or '').lower()
+            if status_lower in ['ontrack', 'on_track']:
+                status_color = 'green'
+            elif status_lower in ['atrisk', 'at_risk']:
+                status_color = 'yellow'
+            elif status_lower in ['offtrack', 'off_track']:
+                status_color = 'red'
+        
+        # Build the combined status text
+        if update_status:
+            status_text = format_status_text(update_status)
+            status_emoji = get_status_emoji(update_status)
+            if status_text:
+                # Add icon
+                status_parts.append({
+                    'type': 'text',
+                    'text': {
+                        'content': status_emoji
+                    },
+                    'annotations': {
+                        'color': status_color,
+                        'code': False,
+                        'bold': False,
+                        'italic': False,
+                        'strikethrough': False,
+                        'underline': False
+                    }
+                })
+                
+                # Add project status + ": " if available
+                if project_status:
+                    status_parts.append({
+                        'type': 'text',
+                        'text': {
+                            'content': f' {project_status}: '
+                        },
+                        'annotations': {
+                            'color': status_color,
+                            'code': False,
+                            'bold': False,
+                            'italic': False,
+                            'strikethrough': False,
+                            'underline': False
+                        }
+                    })
+                else:
+                    # Add space after icon if no project status
+                    status_parts.append({
+                        'type': 'text',
+                        'text': {
+                            'content': ' '
+                        },
+                        'annotations': {
+                            'color': status_color,
+                            'code': False,
+                            'bold': False,
+                            'italic': False,
+                            'strikethrough': False,
+                            'underline': False
+                        }
+                    })
+                
+                # Add update health value
+                status_parts.append({
+                    'type': 'text',
+                    'text': {
+                        'content': status_text
+                    },
+                    'annotations': {
+                        'color': status_color,
+                        'code': False,
+                        'bold': False,
+                        'italic': False,
+                        'strikethrough': False,
+                        'underline': False
+                    }
+                })
+        elif project_status:
+            # If only project status is available (no update health), just show it
+            status_parts.append({
+                'type': 'text',
+                'text': {
+                    'content': project_status
+                },
+                'annotations': {
+                    'color': 'gray',
+                    'code': False,
+                    'bold': False,
+                    'italic': False,
+                    'strikethrough': False,
+                    'underline': False
+                }
+            })
+        
+        if status_parts:
+            blocks.append({
+                'object': 'block',
+                'type': 'paragraph',
+                'paragraph': {
+                    'rich_text': status_parts
+                }
+            })
     
     # Try to convert content using LLM, fallback to script-based approach if it fails
     content_blocks = None
@@ -1450,6 +1658,9 @@ def process_project_update_webhook(webhook_data):
         # Get project information - could be nested or referenced by ID
         project = project_update.get('project')
         print(f"   Project data: {project}")
+        if project:
+            print(f"   Project object keys: {list(project.keys()) if isinstance(project, dict) else 'Not a dict'}")
+            print(f"   Project object structure: {json.dumps(project, indent=2, ensure_ascii=False) if isinstance(project, dict) else project}")
         if not project and project_update.get('projectId'):
             # If only projectId is provided, we'd need to fetch it via API
             # For now, we'll try to get it from the data structure
@@ -1465,6 +1676,24 @@ def process_project_update_webhook(webhook_data):
         if not project_url:
             project_url = project_update.get('url')
         update_body = project_update.get('body', '')
+        
+        # Extract status information
+        update_status = project_update.get('health')  # Update health status
+        
+        # Get project ID for fetching status
+        project_id = None
+        if project:
+            project_id = project.get('id')
+        elif project_update.get('projectId'):
+            project_id = project_update.get('projectId')
+        
+        # Fetch project status from Linear API (not available in webhook)
+        project_status = None
+        if project_id:
+            project_status = get_project_status(project_id)
+        
+        print(f"   Update status: {update_status or 'Not provided'}")
+        print(f"   Project status: {project_status or 'Not provided'}")
         
         # Extract user/author information
         user = project_update.get('user') or project_update.get('creator') or project_update.get('author')
@@ -1589,7 +1818,7 @@ def process_project_update_webhook(webhook_data):
         print(f"   Project: {project_name}")
         if update_id:
             print(f"   Update ID: {update_id}")
-        success = add_project_update_block(page_id, project_name, update_body, project_url, update_id, action)
+        success = add_project_update_block(page_id, project_name, update_body, project_url, update_id, action, project_status, update_status)
         
         if success:
             print(f"✅ Successfully added update to Notion document")
