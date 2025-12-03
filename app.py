@@ -970,9 +970,219 @@ def convert_content_with_fallback(update_body):
     }]
 
 
-def add_project_update_block(page_id, project_name, update_body, project_url=None):
+def find_update_blocks(page_id, update_id):
+    """
+    Find all blocks belonging to a Linear update with the given ID.
+    Returns a tuple: (found: bool, block_ids: list) where block_ids contains
+    the IDs of blocks to delete (from heading to callout marker inclusive).
+    """
+    if not NOTION_API_KEY or not update_id:
+        return False, []
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    try:
+        # Fetch all blocks from the page (handle pagination)
+        blocks_url = f'{NOTION_API_URL}/blocks/{page_id}/children'
+        all_blocks = []
+        next_cursor = None
+        
+        while True:
+            params = {'page_size': 100}
+            if next_cursor:
+                params['start_cursor'] = next_cursor
+            
+            response = requests.get(blocks_url, headers=headers, params=params)
+            
+            if response.status_code != 200:
+                print(f"   ⚠️  Could not fetch blocks: {response.status_code}")
+                break
+            
+            data = response.json()
+            blocks = data.get('results', [])
+            all_blocks.extend(blocks)
+            
+            # Check if there are more pages
+            has_more = data.get('has_more', False)
+            next_cursor = data.get('next_cursor')
+            
+            if not has_more or not next_cursor:
+                break
+        
+        # Find the end marker (paragraph) and then search backwards for the divider start marker
+        end_marker = f"linear-update-id:{update_id}"
+        end_index = None
+        
+        # First, find the end marker paragraph
+        for i, block in enumerate(all_blocks):
+            block_type = block.get('type')
+            if block_type == 'paragraph':
+                paragraph = block.get('paragraph', {})
+                rich_text = paragraph.get('rich_text', [])
+                for rt in rich_text:
+                    text_content = rt.get('text', {}).get('content', '')
+                    if end_marker in text_content:
+                        end_index = i
+                        break
+            if end_index is not None:
+                break
+        
+        if end_index is None:
+            return False, []
+        
+        # Now search backwards from the end marker to find the divider that starts this update
+        # The divider should be followed by a heading_2 with the project name
+        start_index = None
+        for i in range(end_index - 1, -1, -1):
+            block = all_blocks[i]
+            block_type = block.get('type')
+            
+            # Look for a divider that is followed by a heading_2
+            if block_type == 'divider':
+                # Check if the next block is a heading_2
+                if i + 1 < len(all_blocks):
+                    next_block = all_blocks[i + 1]
+                    if next_block.get('type') == 'heading_2':
+                        # This divider is likely our start marker
+                        # Verify by checking there's no other divider between this and the end marker
+                        # (to avoid matching the wrong divider if there are multiple updates)
+                        start_index = i
+                        break
+        
+        if start_index is None:
+            return False, []
+        
+        # Collect all block IDs from divider (start) to end marker (inclusive)
+        block_ids_to_delete = []
+        for i in range(start_index, end_index + 1):
+            block_id = all_blocks[i].get('id')
+            if block_id:
+                block_ids_to_delete.append(block_id)
+        
+        return True, block_ids_to_delete
+        
+    except Exception as e:
+        print(f"   ⚠️  Error finding update blocks: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, []
+
+
+def check_update_already_exists(page_id, update_id):
+    """
+    Check if a Linear update with the given ID already exists in the Notion page.
+    Returns True if the update already exists, False otherwise.
+    """
+    if not NOTION_API_KEY or not update_id:
+        return False
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    try:
+        # Fetch all blocks from the page (handle pagination)
+        blocks_url = f'{NOTION_API_URL}/blocks/{page_id}/children'
+        all_blocks = []
+        next_cursor = None
+        
+        while True:
+            params = {'page_size': 100}
+            if next_cursor:
+                params['start_cursor'] = next_cursor
+            
+            response = requests.get(blocks_url, headers=headers, params=params)
+            
+            if response.status_code != 200:
+                print(f"   ⚠️  Could not fetch blocks to check for duplicates: {response.status_code}")
+                break
+            
+            data = response.json()
+            blocks = data.get('results', [])
+            all_blocks.extend(blocks)
+            
+            # Check if there are more pages
+            has_more = data.get('has_more', False)
+            next_cursor = data.get('next_cursor')
+            
+            if not has_more or not next_cursor:
+                break
+        
+        # Check each block for the update ID
+        # We'll store it in a callout block with a specific format
+        update_id_marker = f"linear-update-id:{update_id}"
+        
+        for block in all_blocks:
+            block_type = block.get('type')
+            if block_type == 'callout':
+                callout = block.get('callout', {})
+                rich_text = callout.get('rich_text', [])
+                # Check if any rich_text contains the update ID marker
+                for rt in rich_text:
+                    text_content = rt.get('text', {}).get('content', '')
+                    if update_id_marker in text_content:
+                        print(f"   ✅ Found existing update with ID: {update_id}")
+                        return True
+            elif block_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3']:
+                # Also check headings and paragraphs for the marker
+                block_data = block.get(block_type, {})
+                rich_text = block_data.get('rich_text', [])
+                for rt in rich_text:
+                    text_content = rt.get('text', {}).get('content', '')
+                    if update_id_marker in text_content:
+                        print(f"   ✅ Found existing update with ID: {update_id}")
+                        return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"   ⚠️  Error checking for duplicate update: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def delete_blocks(block_ids, headers):
+    """
+    Delete multiple blocks from Notion.
+    """
+    if not block_ids:
+        return True
+    
+    success_count = 0
+    for block_id in block_ids:
+        try:
+            delete_url = f'{NOTION_API_URL}/blocks/{block_id}'
+            response = requests.delete(delete_url, headers=headers)
+            if response.status_code == 200:
+                success_count += 1
+            else:
+                print(f"   ⚠️  Failed to delete block {block_id}: {response.status_code}")
+        except Exception as e:
+            print(f"   ⚠️  Error deleting block {block_id}: {e}")
+    
+    print(f"   🗑️  Deleted {success_count}/{len(block_ids)} blocks")
+    return success_count == len(block_ids)
+
+
+def add_project_update_block(page_id, project_name, update_body, project_url=None, update_id=None, action='create'):
     """
     Add a new block to a Notion page with project name as heading and update content.
+    If action is 'update' and the update already exists, replace it.
+    
+    Args:
+        page_id: Notion page ID
+        project_name: Name of the Linear project
+        update_body: Content of the update
+        project_url: Optional URL to the Linear project
+        update_id: Optional Linear update ID for deduplication
+        action: 'create' or 'update' - determines if we skip duplicates or replace them
     """
     if not NOTION_API_KEY:
         print("   ❌ Error: NOTION_API_KEY not set")
@@ -996,18 +1206,27 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
     if project_url:
         heading_text['text']['link'] = {'url': project_url}
 
-    # Start with the heading block
-    blocks = [
-        {
+    # Start with a divider line before the heading for reliable deduplication
+    # This divider serves as the start marker
+    blocks = []
+    if update_id:
+        # Add a divider (line) before the heading - this is our start marker
+        blocks.append({
             'object': 'block',
-            'type': 'heading_2',
-            'heading_2': {
-                'rich_text': [
-                    heading_text
-                ]
-            }
+            'type': 'divider',
+            'divider': {}
+        })
+    
+    # Add the heading block
+    blocks.append({
+        'object': 'block',
+        'type': 'heading_2',
+        'heading_2': {
+            'rich_text': [
+                heading_text
+            ]
         }
-    ]
+    })
     
     # Try to convert content using LLM, fallback to script-based approach if it fails
     content_blocks = None
@@ -1056,9 +1275,48 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
             }
         })
     
+    # Check for duplicate update before adding
+    if update_id:
+        exists, block_ids = find_update_blocks(page_id, update_id)
+        if exists:
+            if action == 'create':
+                # For create actions, skip duplicates to avoid extra LLM costs
+                print(f"   ⏭️  Skipping duplicate create (ID: {update_id})")
+                return True  # Return True because we successfully handled it (by skipping)
+            elif action == 'update':
+                # For update actions, delete the old blocks and replace with new ones
+                print(f"   🔄 Replacing existing update (ID: {update_id})")
+                if block_ids:
+                    delete_blocks(block_ids, headers)
+                # Continue to add new blocks below
+    
     print(f"   Adding blocks to page {page_id}")
     print(f"   Block 1: heading_2 with '{project_name}'")
     print(f"   Content blocks: {len(blocks) - 1}")
+    
+    # Add a plain paragraph block with gray text for the end marker (if provided)
+    # This serves as a marker to prevent duplicates and identify update boundaries
+    if update_id:
+        blocks.append({
+            'object': 'block',
+            'type': 'paragraph',
+            'paragraph': {
+                'rich_text': [{
+                    'type': 'text',
+                    'text': {
+                        'content': f'linear-update-id:{update_id}'
+                    },
+                    'annotations': {
+                        'color': 'gray',
+                        'code': False,
+                        'bold': False,
+                        'italic': False,
+                        'strikethrough': False,
+                        'underline': False
+                    }
+                }]
+            }
+        })
     
     # Debug check: ensure no top-level "link" in rich_text items
     for i, b in enumerate(blocks):
@@ -1185,6 +1443,9 @@ def process_project_update_webhook(webhook_data):
         # Linear may send the data directly or nested under 'projectUpdate'
         project_update = data.get('projectUpdate') or data
         print(f"   Project update keys: {list(project_update.keys()) if isinstance(project_update, dict) else 'Not a dict'}")
+        
+        # Get the update ID for deduplication
+        update_id = project_update.get('id') or project_update.get('slugId')
         
         # Get project information - could be nested or referenced by ID
         project = project_update.get('project')
@@ -1326,7 +1587,9 @@ def process_project_update_webhook(webhook_data):
         # Add the project update as a new block
         print(f"\n📝 Adding project update block to Notion...")
         print(f"   Project: {project_name}")
-        success = add_project_update_block(page_id, project_name, update_body, project_url)
+        if update_id:
+            print(f"   Update ID: {update_id}")
+        success = add_project_update_block(page_id, project_name, update_body, project_url, update_id, action)
         
         if success:
             print(f"✅ Successfully added update to Notion document")
