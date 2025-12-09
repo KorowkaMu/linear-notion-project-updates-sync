@@ -2334,6 +2334,25 @@ def find_or_replace_master_update(week_ending_date, master_blocks):
                 page_id = results[0]['id']
                 print(f"   ✅ Found existing Master Update document: {page_id}")
                 
+                # Update icon to construction worker emoji
+                try:
+                    icon_update_response = requests.patch(
+                        f'{NOTION_API_URL}/pages/{page_id}',
+                        json={
+                            'icon': {
+                                'type': 'emoji',
+                                'emoji': '👷'
+                            }
+                        },
+                        headers=headers
+                    )
+                    if icon_update_response.status_code == 200:
+                        print(f"   ✅ Updated icon to construction worker emoji")
+                    else:
+                        print(f"   ⚠️  Could not update icon: {icon_update_response.status_code}")
+                except Exception as e:
+                    print(f"   ⚠️  Error updating icon: {e}")
+                
                 # Delete all existing blocks
                 blocks_url = f'{NOTION_API_URL}/blocks/{page_id}/children'
                 all_block_ids = []
@@ -2369,6 +2388,10 @@ def find_or_replace_master_update(week_ending_date, master_blocks):
             print("   📝 Creating new Master Update document...")
             page_data = {
                 'parent': {'database_id': NOTION_DATABASE_ID},
+                'icon': {
+                    'type': 'emoji',
+                    'emoji': '👷'
+                },
                 'properties': {
                     'Name': {
                         'title': [
