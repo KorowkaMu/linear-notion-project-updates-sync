@@ -10,9 +10,19 @@ import time
 import json
 import re
 import requests
+import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, abort
 from dotenv import load_dotenv
+
+# Optional schedule import for cron jobs
+schedule = None  # type: ignore
+SCHEDULE_AVAILABLE = False
+try:
+    import schedule  # type: ignore
+    SCHEDULE_AVAILABLE = True
+except ImportError:
+    pass
 
 # Optional ngrok import for local testing
 try:
@@ -48,7 +58,35 @@ load_dotenv()
 LINEAR_API_KEY = os.getenv('LINEAR_API_KEY')
 NOTION_API_KEY = os.getenv('NOTION_API_KEY')
 NOTION_DATABASE_ID = os.getenv('NOTION_DATABASE_ID')
+NOTION_ALL_UPDATES_DATABASE_ID = os.getenv('NOTION_ALL_UPDATES_DATABASE_ID')
 LINEAR_WEBHOOK_SECRET = os.getenv('LINEAR_WEBHOOK_SECRET', '')
+
+
+def format_notion_id(notion_id):
+    """
+    Format a Notion ID to include dashes if missing.
+    Notion IDs are UUIDs that can be provided with or without dashes.
+    """
+    if not notion_id:
+        return None
+    
+    # Remove any existing dashes and whitespace
+    clean_id = notion_id.replace('-', '').strip()
+    
+    # Check if it's a valid UUID length (32 characters)
+    if len(clean_id) != 32:
+        return notion_id  # Return as-is if not valid length
+    
+    # Format as UUID: 8-4-4-4-12
+    formatted = f"{clean_id[0:8]}-{clean_id[8:12]}-{clean_id[12:16]}-{clean_id[16:20]}-{clean_id[20:32]}"
+    return formatted
+
+
+# Format database IDs to ensure they have dashes
+if NOTION_DATABASE_ID:
+    NOTION_DATABASE_ID = format_notion_id(NOTION_DATABASE_ID)
+if NOTION_ALL_UPDATES_DATABASE_ID:
+    NOTION_ALL_UPDATES_DATABASE_ID = format_notion_id(NOTION_ALL_UPDATES_DATABASE_ID)
 USE_NGROK = os.getenv('USE_NGROK', 'false').lower() == 'true'
 NGROK_AUTH_TOKEN = os.getenv('NGROK_AUTH_TOKEN', '')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
@@ -714,6 +752,56 @@ Return a JSON object with the following shape, and NOTHING else:
 
 Guidelines:
 - Use "paragraph" blocks for normal text.
+- Do NOT create heading blocks if not explicitly present in the original content.
+
+- IF heading blocks are present in the original content (heading_1, heading_2, heading_3), ALWAYS use "rich_text" array, NEVER use "text" field:
+  {{
+    "object": "block",
+    "type": "heading_1",
+    "heading_1": {{
+      "rich_text": [
+        {{
+          "type": "text",
+          "text": {{
+            "content": "Heading text here"
+          }}
+        }}
+      ]
+    }}
+  }}
+  IMPORTANT: Do NOT use "text" field directly in heading blocks. Always use "rich_text" array.
+
+- For paragraph blocks, use "rich_text" array:
+  {{
+    "object": "block",
+    "type": "paragraph",
+    "paragraph": {{
+      "rich_text": [
+        {{
+          "type": "text",
+          "text": {{
+            "content": "Paragraph text here"
+          }}
+        }}
+      ]
+    }}
+  }}
+
+- For list items (bulleted_list_item, numbered_list_item), use "rich_text" array:
+  {{
+    "object": "block",
+    "type": "bulleted_list_item",
+    "bulleted_list_item": {{
+      "rich_text": [
+        {{
+          "type": "text",
+          "text": {{
+            "content": "List item text"
+          }}
+        }}
+      ]
+    }}
+  }}
 
 - For ANY URL whose domain contains "linear.app", include it as an inline link within paragraph text using rich_text with link annotations:
   {{
@@ -738,6 +826,8 @@ Guidelines:
   }}
 
 - For other inline links in text, use rich_text with link annotations.
+
+- CRITICAL: All text content (paragraphs, headings, list items) MUST use "rich_text" array format. NEVER use a "text" field directly in block structures.
 
 - Preserve the structure and meaning of the original content.
 
@@ -868,6 +958,21 @@ Content to convert:
                     heading_key = block_dict["type"]
                     if heading_key not in block_dict:
                         block_dict[heading_key] = {}
+                    
+                    # Remove any top-level "text" field from heading block (invalid structure)
+                    if "text" in block_dict[heading_key]:
+                        print(f"   ⚠️  Removing invalid 'text' field from {heading_key} block")
+                        block_dict[heading_key].pop("text", None)
+                    
+                    # Check if LLM used "text" instead of "rich_text" (common mistake)
+                    if "text" in block_dict[heading_key]:
+                        # Convert "text" to "rich_text"
+                        text_value = block_dict[heading_key].pop("text")
+                        if isinstance(text_value, list):
+                            block_dict[heading_key]["rich_text"] = text_value
+                        else:
+                            block_dict[heading_key]["rich_text"] = [text_value] if text_value else []
+                    
                     if "rich_text" not in block_dict[heading_key]:
                         block_dict[heading_key]["rich_text"] = []
                     elif not isinstance(block_dict[heading_key]["rich_text"], list):
@@ -1286,7 +1391,7 @@ def format_status_text(status):
     return status.lower()
 
 
-def add_project_update_block(page_id, project_name, update_body, project_url=None, update_id=None, action='create', project_status=None, update_status=None):
+def add_project_update_block(page_id, project_name, update_body, project_url=None, update_id=None, action='create', project_status=None, update_status=None, add_marker=True):
     """
     Add a new block to a Notion page with project name as heading and update content.
     If action is 'update' and the update already exists, replace it.
@@ -1300,6 +1405,7 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
         action: 'create' or 'update' - determines if we skip duplicates or replace them
         project_status: Optional project status (onTrack, atRisk, offTrack)
         update_status: Optional update status (onTrack, atRisk, offTrack)
+        add_marker: Whether to add the linear-update-id marker (default: True)
     """
     if not NOTION_API_KEY:
         print("   ❌ Error: NOTION_API_KEY not set")
@@ -1525,7 +1631,8 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
     
     # Add a plain paragraph block with gray text for the end marker (if provided)
     # This serves as a marker to prevent duplicates and identify update boundaries
-    if update_id:
+    # Skip marker for "All project updates" database since we use properties for tracking
+    if update_id and add_marker:
         blocks.append({
             'object': 'block',
             'type': 'paragraph',
@@ -1547,9 +1654,23 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
             }
         })
     
-    # Debug check: ensure no top-level "link" in rich_text items
+    # Final validation: ensure blocks are properly structured before sending to Notion
     for i, b in enumerate(blocks):
         t = b.get("type")
+        
+        # Remove any invalid "text" fields from heading blocks
+        if t in ["heading_1", "heading_2", "heading_3"]:
+            heading_key = t
+            if heading_key in b:
+                heading_obj = b[heading_key]
+                if isinstance(heading_obj, dict) and "text" in heading_obj:
+                    print(f"   ⚠️  Block {i}: Removing invalid 'text' field from {heading_key}")
+                    heading_obj.pop("text", None)
+                    # Ensure rich_text exists
+                    if "rich_text" not in heading_obj:
+                        heading_obj["rich_text"] = []
+        
+        # Debug check: ensure no top-level "link" in rich_text items
         if t in ["paragraph", "bulleted_list_item", "numbered_list_item", "heading_1", "heading_2", "heading_3"]:
             key = t if t.startswith("heading_") or t.endswith("_list_item") else "paragraph"
             inner = b.get(key, {})
@@ -1580,6 +1701,786 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
             
     except Exception as e:
         print(f"   ❌ Exception adding project update block: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def get_database_title_property(database_id):
+    """
+    Get the title property name from a Notion database.
+    Returns the property name, or None if not found.
+    """
+    if not NOTION_API_KEY:
+        return None
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    try:
+        response = requests.get(
+            f'{NOTION_API_URL}/databases/{database_id}',
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            db_info = response.json()
+            properties = db_info.get('properties', {})
+            
+            # Find the title property (type == 'title')
+            for prop_name, prop_data in properties.items():
+                if prop_data.get('type') == 'title':
+                    return prop_name
+            
+            # If no title property found, return None
+            return None
+        else:
+            return None
+    except Exception as e:
+        print(f"   ⚠️  Error fetching database schema: {e}")
+        return None
+
+
+def find_existing_update_by_id(update_id):
+    """
+    Find an existing update document by linear-update-id.
+    Returns (page_id, updated_at) if found, (None, None) otherwise.
+    updated_at is the stored updatedAt timestamp from Linear.
+    """
+    if not NOTION_API_KEY or not NOTION_ALL_UPDATES_DATABASE_ID or not update_id:
+        return None, None
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    try:
+        query_url = f'{NOTION_API_URL}/databases/{NOTION_ALL_UPDATES_DATABASE_ID}/query'
+        query_payload = {
+            'filter': {
+                'property': 'linear-update-id',
+                'rich_text': {
+                    'equals': update_id
+                }
+            },
+            'page_size': 1
+        }
+        
+        response = requests.post(query_url, json=query_payload, headers=headers)
+        
+        if response.status_code == 200:
+            results = response.json().get('results', [])
+            if results:
+                page = results[0]
+                page_id = page.get('id')
+                
+                # Get stored updatedAt timestamp
+                props = page.get('properties', {})
+                updated_at_prop = props.get('linear-updated-at', {})
+                stored_updated_at = None
+                
+                # Prioritize rich_text (exact timestamp), fallback to date for backwards compatibility
+                if updated_at_prop.get('type') == 'rich_text':
+                    rich_text = updated_at_prop.get('rich_text', [])
+                    if rich_text:
+                        stored_updated_at = rich_text[0].get('text', {}).get('content', '').strip()
+                elif updated_at_prop.get('type') == 'date':
+                    date_obj = updated_at_prop.get('date', {})
+                    if date_obj:
+                        stored_updated_at = date_obj.get('start')
+                
+                return page_id, stored_updated_at
+        
+        return None, None
+    except Exception as e:
+        print(f"   ⚠️  Error finding existing update: {e}")
+        return None, None
+
+
+def find_or_create_all_updates_document(project_name, project_id, team_name, update_id, week_ending_date, updated_at=None):
+    """
+    Find or create a Notion document in the "All project updates" database.
+    Each update creates a separate page with the project name as title.
+    
+    Args:
+        project_name: Name of the Linear project (used as document title)
+        project_id: Linear project ID (for deduplication)
+        team_name: Team name(s) as string (e.g., "Team A & Team B")
+        update_id: Linear update ID
+        week_ending_date: Date string in YYYY-MM-DD format
+        updated_at: Linear update updatedAt timestamp (ISO format)
+    
+    Returns:
+        page_id if found or created, None otherwise
+    """
+    if not NOTION_API_KEY or not NOTION_ALL_UPDATES_DATABASE_ID:
+        print("   ❌ Error: NOTION_API_KEY and NOTION_ALL_UPDATES_DATABASE_ID must be set")
+        return None
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    # Get the title property name from the database schema
+    title_property = get_database_title_property(NOTION_ALL_UPDATES_DATABASE_ID)
+    if not title_property:
+        print("   ⚠️  Could not find title property in database, trying 'Project name' as fallback")
+        title_property = 'Project name'
+    else:
+        print(f"   📋 Using title property: '{title_property}'")
+    
+    # Determine if multi-team (check for "&" in team name)
+    is_multi_team = " & " in team_name if team_name else False
+    
+    # Create a new page for each update (even if same project)
+    print(f"   📝 Creating new update document in All updates database...")
+    print(f"   Database ID being used: {NOTION_ALL_UPDATES_DATABASE_ID}")
+    print(f"   Project: {project_name}")
+    print(f"   Team: {team_name}")
+    print(f"   Multi-team: {is_multi_team}")
+    print(f"   Week ending on: {week_ending_date}")
+    
+    page_data = {
+        'parent': {'database_id': NOTION_ALL_UPDATES_DATABASE_ID},
+        'properties': {
+            title_property: {
+                'title': [
+                    {
+                        'text': {
+                            'content': project_name
+                        }
+                    }
+                ]
+            },
+            'Team': {
+                'rich_text': [
+                    {
+                        'text': {
+                            'content': team_name if team_name else ''
+                        }
+                    }
+                ]
+            },
+            'Week ending on': {
+                'date': {
+                    'start': week_ending_date
+                }
+            },
+            'linear-project-id': {
+                'rich_text': [
+                    {
+                        'text': {
+                            'content': project_id if project_id else ''
+                        }
+                    }
+                ]
+            },
+            'linear-update-id': {
+                'rich_text': [
+                    {
+                        'text': {
+                            'content': update_id if update_id else ''
+                        }
+                    }
+                ]
+            },
+            'multi-team': {
+                'checkbox': is_multi_team
+            }
+        }
+    }
+    
+    # Add updatedAt timestamp if provided
+    if updated_at:
+        # Store timestamp as rich_text to preserve exact format from Linear
+        # Linear sends: "2025-12-08T21:23:20.860Z"
+        # Store exactly as-is to avoid Notion date property rounding
+        page_data['properties']['linear-updated-at'] = {
+            'rich_text': [
+                {
+                    'text': {
+                        'content': updated_at
+                    }
+                }
+            ]
+        }
+    
+    try:
+        create_response = requests.post(
+            f'{NOTION_API_URL}/pages',
+            json=page_data,
+            headers=headers
+        )
+        
+        print(f"   Create response status: {create_response.status_code}")
+        
+        if create_response.status_code == 200:
+            page_id = create_response.json()['id']
+            print(f"   ✅ Created new update document: {page_id}")
+            return page_id
+        else:
+            print(f"   ❌ Error creating update document: {create_response.status_code}")
+            print(f"   Response: {create_response.text}")
+            if create_response.status_code == 404:
+                print(f"   💡 Troubleshooting:")
+                print(f"      1. Verify the database ID is correct: {NOTION_ALL_UPDATES_DATABASE_ID}")
+                print(f"      2. Make sure the database is shared with your Notion integration")
+                print(f"      3. Check that the database exists and is accessible")
+            return None
+            
+    except Exception as e:
+        print(f"   ❌ Exception creating update document: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def fetch_updates_for_week(week_ending_date):
+    """
+    Fetch all update records from All updates database for a specific week ending date.
+    
+    Args:
+        week_ending_date: Date string in YYYY-MM-DD format
+    
+    Returns:
+        List of page objects from Notion API
+    """
+    if not NOTION_API_KEY or not NOTION_ALL_UPDATES_DATABASE_ID:
+        print("   ❌ Error: NOTION_API_KEY and NOTION_ALL_UPDATES_DATABASE_ID must be set")
+        return []
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    query_url = f'{NOTION_API_URL}/databases/{NOTION_ALL_UPDATES_DATABASE_ID}/query'
+    all_results = []
+    next_cursor = None
+    
+    try:
+        while True:
+            query_payload = {
+                'filter': {
+                    'property': 'Week ending on',
+                    'date': {
+                        'equals': week_ending_date
+                    }
+                },
+                'page_size': 100
+            }
+            
+            if next_cursor:
+                query_payload['start_cursor'] = next_cursor
+            
+            response = requests.post(query_url, json=query_payload, headers=headers)
+            
+            if response.status_code != 200:
+                print(f"   ⚠️  Error querying database: {response.status_code}")
+                print(f"   Response: {response.text}")
+                break
+            
+            data = response.json()
+            results = data.get('results', [])
+            all_results.extend(results)
+            
+            has_more = data.get('has_more', False)
+            next_cursor = data.get('next_cursor')
+            
+            if not has_more or not next_cursor:
+                break
+        
+        print(f"   ✅ Fetched {len(all_results)} update records for week ending {week_ending_date}")
+        return all_results
+        
+    except Exception as e:
+        print(f"   ❌ Exception fetching updates: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def deduplicate_updates(updates):
+    """
+    Remove duplicate updates for the same project, keeping the one with the freshest Last edited time.
+    
+    Args:
+        updates: List of Notion page objects
+    
+    Returns:
+        List of deduplicated updates
+    """
+    # Group by project ID
+    project_updates = {}
+    
+    for update in updates:
+        props = update.get('properties', {})
+        project_id_prop = props.get('linear-project-id', {})
+        project_id = None
+        
+        # Extract project ID from rich_text property
+        if project_id_prop.get('type') == 'rich_text':
+            rich_text = project_id_prop.get('rich_text', [])
+            if rich_text:
+                project_id = rich_text[0].get('text', {}).get('content', '').strip()
+        
+        if not project_id:
+            # If no project ID, use project name as fallback
+            # Try "Project name" first (for All updates database), then "Name" (for weekly updates database)
+            name_prop = props.get('Project name', {}) or props.get('Name', {})
+            if name_prop.get('type') == 'title':
+                title = name_prop.get('title', [])
+                if title:
+                    project_id = title[0].get('text', {}).get('content', '').strip()
+        
+        if not project_id:
+            # Skip updates without project identifier
+            continue
+        
+        # Get last edited time
+        last_edited = update.get('last_edited_time', '')
+        
+        if project_id not in project_updates:
+            project_updates[project_id] = update
+        else:
+            # Compare last edited times and keep the fresher one
+            existing_last_edited = project_updates[project_id].get('last_edited_time', '')
+            if last_edited > existing_last_edited:
+                project_updates[project_id] = update
+    
+    deduplicated = list(project_updates.values())
+    print(f"   ✅ Deduplicated {len(updates)} updates to {len(deduplicated)} unique projects")
+    return deduplicated
+
+
+def get_update_content_blocks(page_id):
+    """
+    Fetch all content blocks from a Notion page.
+    Returns blocks without dividers and linear-update-id markers.
+    
+    Args:
+        page_id: Notion page ID
+    
+    Returns:
+        List of block objects (filtered)
+    """
+    if not NOTION_API_KEY:
+        return []
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    all_blocks = []
+    next_cursor = None
+    
+    try:
+        blocks_url = f'{NOTION_API_URL}/blocks/{page_id}/children'
+        
+        while True:
+            params = {'page_size': 100}
+            if next_cursor:
+                params['start_cursor'] = next_cursor
+            
+            response = requests.get(blocks_url, headers=headers, params=params)
+            
+            if response.status_code != 200:
+                break
+            
+            data = response.json()
+            blocks = data.get('results', [])
+            all_blocks.extend(blocks)
+            
+            has_more = data.get('has_more', False)
+            next_cursor = data.get('next_cursor')
+            
+            if not has_more or not next_cursor:
+                break
+        
+        # Filter out dividers and linear-update-id markers, and convert to creation format
+        filtered_blocks = []
+        for block in all_blocks:
+            block_type = block.get('type')
+            
+            # Skip dividers
+            if block_type == 'divider':
+                continue
+            
+            # Check all block types for linear-update-id markers
+            # Extract text content from the block
+            text_content = ''
+            block_data = block.get(block_type, {})
+            
+            # Get rich_text from various block types
+            if 'rich_text' in block_data:
+                rich_text = block_data.get('rich_text', [])
+                text_content = ''.join([rt.get('text', {}).get('content', '') for rt in rich_text])
+            elif block_type in ['heading_1', 'heading_2', 'heading_3']:
+                rich_text = block_data.get('rich_text', [])
+                text_content = ''.join([rt.get('text', {}).get('content', '') for rt in rich_text])
+            elif block_type in ['bulleted_list_item', 'numbered_list_item']:
+                rich_text = block_data.get('rich_text', [])
+                text_content = ''.join([rt.get('text', {}).get('content', '') for rt in rich_text])
+            
+            # Skip any block containing linear-update-id marker
+            if 'linear-update-id:' in text_content:
+                print(f"   🗑️  Filtering out block with linear-update-id marker: {block_type}")
+                continue
+            
+            # Convert block to creation format (remove metadata, keep structure)
+            new_block = {
+                'object': 'block',
+                'type': block_type
+            }
+            
+            # Copy the type-specific content
+            if block_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3', 
+                            'bulleted_list_item', 'numbered_list_item', 'to_do', 
+                            'toggle', 'quote', 'callout', 'code', 'embed']:
+                type_key = block_type
+                if type_key in block:
+                    block_content = block[type_key].copy()
+                    
+                    # Remove linear-update-id marker from rich_text if present
+                    if 'rich_text' in block_content:
+                        filtered_rich_text = []
+                        for rt_item in block_content['rich_text']:
+                            rt_text = rt_item.get('text', {}).get('content', '')
+                            # Skip rich_text items that contain the marker
+                            if 'linear-update-id:' not in rt_text:
+                                filtered_rich_text.append(rt_item)
+                            else:
+                                print(f"   🗑️  Filtering out rich_text item with linear-update-id marker")
+                        
+                        # Only add block if there's still content after filtering
+                        if filtered_rich_text:
+                            block_content['rich_text'] = filtered_rich_text
+                            new_block[type_key] = block_content
+                        else:
+                            # Skip this block entirely if all content was filtered
+                            continue
+                    else:
+                        new_block[type_key] = block_content
+                else:
+                    new_block[type_key] = {}
+            
+            filtered_blocks.append(new_block)
+        
+        return filtered_blocks
+        
+    except Exception as e:
+        print(f"   ⚠️  Error fetching blocks: {e}")
+        return []
+
+
+def generate_master_update(updates, week_ending_date):
+    """
+    Generate Master Update document content from deduplicated updates.
+    Groups updates by team, with multi-team projects in a separate section.
+    
+    Args:
+        updates: List of deduplicated Notion page objects
+        week_ending_date: Date string in YYYY-MM-DD format
+    
+    Returns:
+        List of blocks for the Master Update document
+    """
+    # Separate single-team and multi-team updates
+    single_team_updates = {}
+    multi_team_updates = []
+    
+    for update in updates:
+        props = update.get('properties', {})
+        multi_team_prop = props.get('multi-team', {})
+        is_multi_team = multi_team_prop.get('checkbox', False) if multi_team_prop.get('type') == 'checkbox' else False
+        
+        if is_multi_team:
+            multi_team_updates.append(update)
+        else:
+            # Get team name
+            team_prop = props.get('Team', {})
+            team_name = ''
+            if team_prop.get('type') == 'rich_text':
+                rich_text = team_prop.get('rich_text', [])
+                if rich_text:
+                    team_name = rich_text[0].get('text', {}).get('content', '').strip()
+            
+            if not team_name:
+                # No team assigned, put in multi-team section
+                multi_team_updates.append(update)
+            else:
+                if team_name not in single_team_updates:
+                    single_team_updates[team_name] = []
+                single_team_updates[team_name].append(update)
+    
+    # Sort updates within each team by last_edited_time (ascending)
+    for team_name in single_team_updates:
+        single_team_updates[team_name].sort(key=lambda x: x.get('last_edited_time', ''))
+    multi_team_updates.sort(key=lambda x: x.get('last_edited_time', ''))
+    
+    # Build Master Update blocks
+    master_blocks = []
+    
+    # Add team sections
+    for team_name in sorted(single_team_updates.keys()):
+        # Add team heading
+        master_blocks.append({
+            'object': 'block',
+            'type': 'heading_1',
+            'heading_1': {
+                'rich_text': [{
+                    'type': 'text',
+                    'text': {
+                        'content': team_name
+                    }
+                }]
+            }
+        })
+        
+        # Add updates for this team
+        for update in single_team_updates[team_name]:
+            page_id = update.get('id')
+            content_blocks = get_update_content_blocks(page_id)
+            master_blocks.extend(content_blocks)
+    
+    # Add multi-team section
+    if multi_team_updates:
+        master_blocks.append({
+            'object': 'block',
+            'type': 'heading_1',
+            'heading_1': {
+                'rich_text': [{
+                    'type': 'text',
+                    'text': {
+                        'content': 'Multi-team projects'
+                    }
+                }]
+            }
+        })
+        
+        for update in multi_team_updates:
+            page_id = update.get('id')
+            content_blocks = get_update_content_blocks(page_id)
+            master_blocks.extend(content_blocks)
+    
+    return master_blocks
+
+
+def find_or_replace_master_update(week_ending_date, master_blocks):
+    """
+    Find or create Master Update document for a week, replacing it entirely if it exists.
+    
+    Args:
+        week_ending_date: Date string in YYYY-MM-DD format
+        master_blocks: List of blocks for the Master Update
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if not NOTION_API_KEY or not NOTION_DATABASE_ID:
+        print("   ❌ Error: NOTION_API_KEY and NOTION_DATABASE_ID must be set")
+        return False
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    document_title = "Project Updates"
+    
+    # Try to find existing document
+    query_url = f'{NOTION_API_URL}/databases/{NOTION_DATABASE_ID}/query'
+    
+    try:
+        query_response = requests.post(
+            query_url,
+            json={
+                'filter': {
+                    'and': [
+                        {
+                            'property': 'Name',
+                            'title': {
+                                'equals': document_title
+                            }
+                        },
+                        {
+                            'property': 'Week ending on',
+                            'date': {
+                                'equals': week_ending_date
+                            }
+                        }
+                    ]
+                },
+                'page_size': 1
+            },
+            headers=headers
+        )
+        
+        page_id = None
+        if query_response.status_code == 200:
+            results = query_response.json().get('results', [])
+            if results:
+                page_id = results[0]['id']
+                print(f"   ✅ Found existing Master Update document: {page_id}")
+                
+                # Delete all existing blocks
+                blocks_url = f'{NOTION_API_URL}/blocks/{page_id}/children'
+                all_block_ids = []
+                next_cursor = None
+                
+                while True:
+                    params = {'page_size': 100}
+                    if next_cursor:
+                        params['start_cursor'] = next_cursor
+                    
+                    get_response = requests.get(blocks_url, headers=headers, params=params)
+                    if get_response.status_code != 200:
+                        break
+                    
+                    data = get_response.json()
+                    blocks = data.get('results', [])
+                    all_block_ids.extend([b['id'] for b in blocks])
+                    
+                    has_more = data.get('has_more', False)
+                    next_cursor = data.get('next_cursor')
+                    
+                    if not has_more or not next_cursor:
+                        break
+                
+                # Delete all blocks
+                for block_id in all_block_ids:
+                    requests.delete(f'{NOTION_API_URL}/blocks/{block_id}', headers=headers)
+                
+                print(f"   🗑️  Deleted {len(all_block_ids)} existing blocks")
+        
+        # Create new document if not found
+        if not page_id:
+            print("   📝 Creating new Master Update document...")
+            page_data = {
+                'parent': {'database_id': NOTION_DATABASE_ID},
+                'properties': {
+                    'Name': {
+                        'title': [
+                            {
+                                'text': {
+                                    'content': document_title
+                                }
+                            }
+                        ]
+                    },
+                    'Week ending on': {
+                        'date': {
+                            'start': week_ending_date
+                        }
+                    }
+                }
+            }
+            
+            create_response = requests.post(
+                f'{NOTION_API_URL}/pages',
+                json=page_data,
+                headers=headers
+            )
+            
+            if create_response.status_code != 200:
+                print(f"   ❌ Error creating Master Update: {create_response.status_code}")
+                print(f"   Response: {create_response.text}")
+                return False
+            
+            page_id = create_response.json()['id']
+            print(f"   ✅ Created new Master Update document: {page_id}")
+        
+        # Add new blocks
+        if master_blocks:
+            blocks_url = f'{NOTION_API_URL}/blocks/{page_id}/children'
+            response = requests.patch(
+                blocks_url,
+                json={'children': master_blocks},
+                headers=headers
+            )
+            
+            if response.status_code == 200:
+                print(f"   ✅ Successfully added {len(master_blocks)} blocks to Master Update")
+                return True
+            else:
+                print(f"   ❌ Error adding blocks: {response.status_code}")
+                print(f"   Response: {response.text}")
+                return False
+        else:
+            print("   ⚠️  No blocks to add")
+            return True
+            
+    except Exception as e:
+        print(f"   ❌ Exception managing Master Update: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def generate_master_update_for_week():
+    """
+    Main function to generate Master Update for the nearest Friday.
+    Fetches updates, deduplicates, and creates Master Update document.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        print("\n" + "="*60)
+        print("🔄 Generating Master Update...")
+        print("="*60)
+        
+        # Calculate week ending date (nearest Friday)
+        last_friday = get_last_friday_of_week()
+        week_ending_date = last_friday.strftime('%Y-%m-%d')
+        print(f"   Week ending on: {week_ending_date}")
+        
+        # Fetch all updates for this week
+        print("\n📥 Fetching updates from All updates database...")
+        updates = fetch_updates_for_week(week_ending_date)
+        
+        if not updates:
+            print("   ⚠️  No updates found for this week")
+            return True  # Not an error, just no updates
+        
+        # Deduplicate updates
+        print("\n🔍 Deduplicating updates...")
+        deduplicated = deduplicate_updates(updates)
+        
+        if not deduplicated:
+            print("   ⚠️  No updates after deduplication")
+            return True
+        
+        # Generate Master Update blocks
+        print("\n📝 Generating Master Update content...")
+        master_blocks = generate_master_update(deduplicated, week_ending_date)
+        
+        if not master_blocks:
+            print("   ⚠️  No content blocks generated")
+            return True
+        
+        # Create or replace Master Update document
+        print("\n💾 Saving Master Update document...")
+        success = find_or_replace_master_update(week_ending_date, master_blocks)
+        
+        if success:
+            print("\n✅ Master Update generated successfully!")
+        else:
+            print("\n❌ Failed to generate Master Update")
+        
+        return success
+        
+    except Exception as e:
+        print(f"\n❌ Error generating Master Update: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -1676,6 +2577,62 @@ def process_project_update_webhook(webhook_data):
         # Get the update ID for deduplication
         update_id = project_update.get('id') or project_update.get('slugId')
         
+        # Get updatedAt timestamp for deduplication
+        updated_at = project_update.get('updatedAt')
+        created_at = project_update.get('createdAt')
+        
+        # Check if this update was already processed
+        if update_id:
+            existing_page_id, stored_updated_at = find_existing_update_by_id(update_id)
+            
+            if existing_page_id:
+                # Update exists, check if it was edited
+                if updated_at and stored_updated_at:
+                    # Compare timestamps (both stored as strings in rich_text)
+                    try:
+                        # First, try direct string comparison (fastest, exact match)
+                        if updated_at == stored_updated_at:
+                            # Exact match - duplicate webhook delivery
+                            print(f"   ⏭️  Skipping duplicate webhook delivery (exact timestamp match)")
+                            print(f"      Stored updatedAt: {stored_updated_at}")
+                            print(f"      Webhook updatedAt: {updated_at}")
+                            return True  # Return True to indicate successful handling (by skipping)
+                        
+                        # If strings don't match, parse and compare as datetime objects
+                        # Normalize webhook timestamp
+                        webhook_ts = updated_at.replace('Z', '+00:00') if updated_at.endswith('Z') else updated_at
+                        webhook_time = datetime.fromisoformat(webhook_ts)
+                        
+                        # Normalize stored timestamp (may be from old date property or rich_text)
+                        stored_ts = stored_updated_at.replace('Z', '+00:00') if stored_updated_at.endswith('Z') else stored_updated_at
+                        stored_time = datetime.fromisoformat(stored_ts)
+                        
+                        # Compare timestamps
+                        time_diff = (webhook_time - stored_time).total_seconds()
+                        
+                        if time_diff <= 0:
+                            # Webhook timestamp is same or older, skip processing (duplicate delivery)
+                            print(f"   ⏭️  Skipping duplicate webhook delivery (update already processed)")
+                            print(f"      Stored updatedAt: {stored_updated_at}")
+                            print(f"      Webhook updatedAt: {updated_at}")
+                            print(f"      Time difference: {time_diff:.3f} seconds")
+                            return True  # Return True to indicate successful handling (by skipping)
+                        else:
+                            # Update was edited (webhook timestamp is newer), we need to process it
+                            print(f"   🔄 Update was edited, will update existing document")
+                            print(f"      Stored updatedAt: {stored_updated_at}")
+                            print(f"      Webhook updatedAt: {updated_at}")
+                            print(f"      Time difference: {time_diff:.3f} seconds")
+                    except Exception as e:
+                        print(f"   ⚠️  Error comparing timestamps: {e}, processing anyway")
+                        import traceback
+                        print(traceback.format_exc())
+                elif action == 'create':
+                    # If we can't compare timestamps but action is 'create', it's likely a duplicate
+                    print(f"   ⏭️  Skipping duplicate webhook delivery (update already exists, action=create)")
+                    return True
+                # If action is 'update', process it (it's an edit)
+        
         # Get project information - could be nested or referenced by ID
         project = project_update.get('project')
         print(f"   Project data: {project}")
@@ -1732,8 +2689,13 @@ def process_project_update_webhook(webhook_data):
         print(f"   Update body preview: {update_body[:100] if update_body else '(empty)'}...")
         print(f"   Contact/Author: {contact_name or 'Unknown'}")
         
-        if not update_body:
-            print("⚠️  Warning: Update body is empty")
+        # Skip processing if update body is empty (unless it's an explicit update action)
+        if not update_body or not update_body.strip():
+            if action == 'create':
+                print("⚠️  Skipping empty update (no content to process)")
+                return True  # Return True to indicate successful handling (by skipping)
+            else:
+                print("⚠️  Warning: Update body is empty, but processing as edit")
         
         # Get team information
         team_names = []
@@ -1811,35 +2773,120 @@ def process_project_update_webhook(webhook_data):
             team_name = project_name if project_name and project_name != "Unknown Project" else "Unknown Team"
             print(f"   ⚠️  Could not determine team name, using project name: {team_name}")
         
-        # Get current date in YYYY-MM-DD format
-        date_str = datetime.now().strftime('%Y-%m-%d')
-        print(f"   Date string: {date_str}")
+        # Calculate week ending date (last Friday)
+        last_friday = get_last_friday_of_week()
+        week_ending_date = last_friday.strftime('%Y-%m-%d')
+        print(f"   Week ending on: {week_ending_date}")
         
-        # Find or create the Notion document
-        print(f"\n📄 Finding or creating Notion document...")
-        print(f"   Team: {team_name}")
-        print(f"   Date: {date_str}")
-        print(f"   Document title will be: '{team_name} Update'")
+        # Check if update already exists (for edit case)
+        existing_page_id = None
+        if update_id:
+            existing_page_id, _ = find_existing_update_by_id(update_id)
         
-        page_id = find_or_create_notion_document(team_name, date_str, contact_name)
+        # Prepare headers for API calls
+        headers = {
+            'Authorization': f'Bearer {NOTION_API_KEY}',
+            'Content-Type': 'application/json',
+            'Notion-Version': '2022-06-28',
+        }
+        
+        # Create or update document in All project updates database
+        if existing_page_id:
+            print(f"\n📄 Updating existing update document in All project updates database...")
+            print(f"   Existing page ID: {existing_page_id}")
+            print(f"   Project: {project_name}")
+            print(f"   Update ID: {update_id}")
+            
+            # Update the updatedAt timestamp
+            if updated_at:
+                try:
+                    # Store timestamp as rich_text to preserve exact format from Linear
+                    update_props = {
+                        'linear-updated-at': {
+                            'rich_text': [
+                                {
+                                    'text': {
+                                        'content': updated_at
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                    update_response = requests.patch(
+                        f'{NOTION_API_URL}/pages/{existing_page_id}',
+                        json={'properties': update_props},
+                        headers=headers
+                    )
+                    if update_response.status_code == 200:
+                        print(f"   ✅ Updated linear-updated-at timestamp")
+                    else:
+                        print(f"   ⚠️  Failed to update timestamp: {update_response.status_code} - {update_response.text}")
+                except Exception as e:
+                    print(f"   ⚠️  Could not update timestamp: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            page_id = existing_page_id
+            
+            # Delete existing content blocks to replace with new content
+            print(f"   🗑️  Deleting existing content blocks...")
+            blocks_url = f'{NOTION_API_URL}/blocks/{page_id}/children'
+            all_block_ids = []
+            next_cursor = None
+            
+            while True:
+                params = {'page_size': 100}
+                if next_cursor:
+                    params['start_cursor'] = next_cursor
+                
+                get_response = requests.get(blocks_url, headers=headers, params=params)
+                if get_response.status_code != 200:
+                    break
+                
+                data = get_response.json()
+                blocks = data.get('results', [])
+                all_block_ids.extend([b['id'] for b in blocks])
+                
+                has_more = data.get('has_more', False)
+                next_cursor = data.get('next_cursor')
+                
+                if not has_more or not next_cursor:
+                    break
+            
+            # Delete all blocks
+            for block_id in all_block_ids:
+                requests.delete(f'{NOTION_API_URL}/blocks/{block_id}', headers=headers)
+            
+            print(f"   🗑️  Deleted {len(all_block_ids)} existing blocks")
+        else:
+            print(f"\n📄 Creating update document in All project updates database...")
+            print(f"   Project: {project_name}")
+            print(f"   Project ID: {project_id or 'Not provided'}")
+            print(f"   Team: {team_name}")
+            print(f"   Update ID: {update_id or 'Not provided'}")
+            
+            page_id = find_or_create_all_updates_document(
+                project_name, 
+                project_id or '', 
+                team_name, 
+                update_id or '', 
+                week_ending_date,
+                updated_at
+            )
         
         if not page_id:
-            print("❌ Failed to find or create Notion document")
+            print("❌ Failed to create update document in All updates database")
             return False
         
-        print(f"✅ Notion document found/created with ID: {page_id}")
+        print(f"✅ Update document created with ID: {page_id}")
         
-        # Update Contact property with the author
-        if contact_name:
-            print(f"\n👤 Updating Contact property with: {contact_name}")
-            update_contact_property(page_id, contact_name)
-        
-        # Add the project update as a new block
-        print(f"\n📝 Adding project update block to Notion...")
+        # Add the project update as blocks (same format as before)
+        print(f"\n📝 Adding project update blocks...")
         print(f"   Project: {project_name}")
         if update_id:
             print(f"   Update ID: {update_id}")
-        success = add_project_update_block(page_id, project_name, update_body, project_url, update_id, action, project_status, update_status)
+        # Don't add marker for "All project updates" database - we use properties for tracking
+        success = add_project_update_block(page_id, project_name, update_body, project_url, update_id, action, project_status, update_status, add_marker=False)
         
         if success:
             print(f"✅ Successfully added update to Notion document")
@@ -1970,6 +3017,316 @@ def health_check():
     return jsonify({'status': 'ok'}), 200
 
 
+@app.route('/generate-master-update', methods=['POST'])
+def trigger_master_update():
+    """
+    Manually trigger Master Update generation.
+    Useful for testing or manual runs.
+    """
+    try:
+        print("\n" + "="*60)
+        print("🔧 Manual Master Update trigger")
+        print("="*60)
+        success = generate_master_update_for_week()
+        if success:
+            return jsonify({'status': 'success', 'message': 'Master Update generated successfully'}), 200
+        else:
+            return jsonify({'status': 'error', 'message': 'Failed to generate Master Update'}), 500
+    except Exception as e:
+        print(f"❌ Error in manual trigger: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/test-database/<database_id>', methods=['GET'])
+def test_database(database_id):
+    """
+    Test if a database ID is accessible.
+    Useful for debugging database access issues.
+    """
+    if not NOTION_API_KEY:
+        return jsonify({'status': 'error', 'message': 'NOTION_API_KEY not set'}), 500
+    
+    # Format the ID
+    formatted_id = format_notion_id(database_id)
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    try:
+        response = requests.get(
+            f'{NOTION_API_URL}/databases/{formatted_id}',
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            db_info = response.json()
+            db_title = db_info.get('title', [{}])[0].get('plain_text', 'Unknown')
+            return jsonify({
+                'status': 'success',
+                'message': 'Database accessible',
+                'database_id': formatted_id,
+                'title': db_title,
+                'raw_response': db_info
+            }), 200
+        else:
+            error_data = response.json() if response.text else {}
+            return jsonify({
+                'status': 'error',
+                'message': 'Database not accessible',
+                'database_id': formatted_id,
+                'status_code': response.status_code,
+                'error': error_data.get('message', response.text)
+            }), response.status_code
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'database_id': formatted_id
+        }), 500
+
+
+@app.route('/sample-timestamps', methods=['GET'])
+def sample_timestamps():
+    """
+    Fetch sample timestamp values from the 'linear-updated-at' property
+    in the All project updates database to understand Notion's format.
+    """
+    if not NOTION_API_KEY or not NOTION_ALL_UPDATES_DATABASE_ID:
+        return jsonify({'error': 'Notion API key or database ID not configured'}), 500
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    try:
+        query_url = f'{NOTION_API_URL}/databases/{NOTION_ALL_UPDATES_DATABASE_ID}/query'
+        query_payload = {
+            'page_size': 10,  # Get up to 10 samples
+            'sorts': [
+                {
+                    'property': 'linear-updated-at',
+                    'direction': 'descending'
+                }
+            ]
+        }
+        
+        response = requests.post(query_url, json=query_payload, headers=headers)
+        
+        if response.status_code != 200:
+            return jsonify({
+                'error': f'Failed to query database: {response.status_code}',
+                'response': response.text
+            }), response.status_code
+        
+        results = response.json().get('results', [])
+        samples = []
+        
+        for page in results:
+            props = page.get('properties', {})
+            updated_at_prop = props.get('linear-updated-at', {})
+            prop_type = updated_at_prop.get('type')
+            
+            sample = {
+                'page_id': page.get('id'),
+                'property_type': prop_type,
+                'raw_value': updated_at_prop,
+            }
+            
+            if prop_type == 'date':
+                date_obj = updated_at_prop.get('date', {})
+                if date_obj:
+                    sample['stored_value'] = date_obj.get('start')
+                    sample['timezone'] = date_obj.get('time_zone')
+            elif prop_type == 'rich_text':
+                rich_text = updated_at_prop.get('rich_text', [])
+                if rich_text:
+                    sample['stored_value'] = rich_text[0].get('text', {}).get('content', '')
+            
+            samples.append(sample)
+        
+        return jsonify({
+            'count': len(samples),
+            'samples': samples
+        }), 200
+        
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'error': f'Exception fetching samples: {str(e)}',
+            'traceback': traceback.format_exc()
+        }), 500
+
+
+@app.route('/list-database-properties', methods=['GET'])
+def list_database_properties():
+    """
+    List all properties of the All project updates database.
+    Useful for debugging property name issues.
+    """
+    if not NOTION_API_KEY or not NOTION_ALL_UPDATES_DATABASE_ID:
+        return jsonify({'status': 'error', 'message': 'NOTION_API_KEY and NOTION_ALL_UPDATES_DATABASE_ID must be set'}), 500
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    try:
+        response = requests.get(
+            f'{NOTION_API_URL}/databases/{NOTION_ALL_UPDATES_DATABASE_ID}',
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            db_info = response.json()
+            db_title = db_info.get('title', [{}])[0].get('plain_text', 'Unknown')
+            properties = db_info.get('properties', {})
+            
+            # Format properties for display
+            properties_list = []
+            for prop_name, prop_data in properties.items():
+                prop_type = prop_data.get('type', 'unknown')
+                properties_list.append({
+                    'name': prop_name,
+                    'type': prop_type,
+                    'details': prop_data
+                })
+            
+            # Print to console as well
+            print("\n" + "="*60)
+            print(f"📋 Database: {db_title}")
+            print(f"📋 Database ID: {NOTION_ALL_UPDATES_DATABASE_ID}")
+            print("="*60)
+            print("Properties:")
+            for prop in properties_list:
+                print(f"  - {prop['name']} ({prop['type']})")
+            print("="*60 + "\n")
+            
+            return jsonify({
+                'status': 'success',
+                'database_title': db_title,
+                'database_id': NOTION_ALL_UPDATES_DATABASE_ID,
+                'properties': properties_list,
+                'properties_count': len(properties_list)
+            }), 200
+        else:
+            error_data = response.json() if response.text else {}
+            return jsonify({
+                'status': 'error',
+                'message': 'Database not accessible',
+                'status_code': response.status_code,
+                'error': error_data.get('message', response.text)
+            }), response.status_code
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+def is_friday_to_monday():
+    """
+    Check if current day is Friday, Saturday, Sunday, or Monday (in UTC).
+    Returns True if it's one of these days, False otherwise.
+    """
+    # Get current UTC time
+    now_utc = datetime.utcnow()
+    # Get day of week (Monday=0, Sunday=6)
+    day_of_week = now_utc.weekday()
+    
+    # Friday=4, Saturday=5, Sunday=6, Monday=0
+    return day_of_week in [0, 4, 5, 6]
+
+
+def run_master_update_with_retries(max_retries=5):
+    """
+    Run Master Update generation with retry logic.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"\n🔄 Attempt {attempt}/{max_retries} to generate Master Update...")
+            success = generate_master_update_for_week()
+            if success:
+                print(f"✅ Master Update generated successfully on attempt {attempt}")
+                return True
+            else:
+                if attempt < max_retries:
+                    wait_time = attempt * 60  # Exponential backoff: 1min, 2min, 3min, etc.
+                    print(f"⚠️  Attempt {attempt} failed, retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+        except Exception as e:
+            print(f"❌ Error on attempt {attempt}: {e}")
+            if attempt < max_retries:
+                wait_time = attempt * 60
+                print(f"   Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                print(f"❌ All {max_retries} attempts failed")
+                import traceback
+                traceback.print_exc()
+    
+    return False
+
+
+def cron_job_worker():
+    """
+    Background worker thread that runs the cron job scheduler.
+    Checks every minute if it's time to run the Master Update generation.
+    """
+    if not SCHEDULE_AVAILABLE:
+        print("⚠️  schedule library not available, cron jobs disabled")
+        return
+    
+    if schedule is None:  # type: ignore
+        print("⚠️  schedule module not loaded, cron jobs disabled")
+        return
+    
+    def job():
+        """Job to run - only execute if it's Friday-Monday"""
+        if is_friday_to_monday():
+            print("\n⏰ Cron job triggered (Friday-Monday)")
+            run_master_update_with_retries()
+        else:
+            print(f"⏰ Cron job skipped (not Friday-Monday, current day: {datetime.utcnow().strftime('%A')})")
+    
+    # Schedule job to run every 2 hours
+    schedule.every(2).hours.do(job)  # type: ignore
+    
+    print("🕐 Cron job scheduler started (runs every 2 hours, Friday-Monday only)")
+    
+    # Run the scheduler
+    while True:
+        schedule.run_pending()  # type: ignore
+        time.sleep(60)  # Check every minute
+
+
+def start_cron_job():
+    """
+    Start the cron job in a background thread.
+    """
+    if not SCHEDULE_AVAILABLE:
+        print("⚠️  schedule library not available, install with: pip install schedule")
+        return
+    
+    thread = threading.Thread(target=cron_job_worker, daemon=True)
+    thread.start()
+    print("✅ Cron job thread started")
+
+
 @app.before_request
 def log_request_info():
     """
@@ -1981,6 +3338,82 @@ def log_request_info():
             print(f"   ⚠️  Request to {request.path} - this endpoint doesn't exist!")
             print(f"   💡 Webhook endpoint is at: /webhook")
             print(f"   💡 Make sure your Linear webhook URL ends with /webhook")
+
+
+def validate_notion_databases():
+    """
+    Validate that both Notion databases are accessible.
+    Returns True if both are accessible, False otherwise.
+    """
+    if not NOTION_API_KEY:
+        return False
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    all_valid = True
+    
+    # Check weekly updates database
+    if NOTION_DATABASE_ID:
+        try:
+            print(f"   Checking weekly updates database: {NOTION_DATABASE_ID}")
+            response = requests.get(
+                f'{NOTION_API_URL}/databases/{NOTION_DATABASE_ID}',
+                headers=headers
+            )
+            if response.status_code == 200:
+                db_info = response.json()
+                db_title = db_info.get('title', [{}])[0].get('plain_text', 'Unknown')
+                print(f"✅ Weekly updates database accessible: {db_title}")
+            else:
+                print(f"❌ Weekly updates database not accessible: {response.status_code}")
+                print(f"   Response: {response.text}")
+                all_valid = False
+        except Exception as e:
+            print(f"❌ Error checking weekly updates database: {e}")
+            all_valid = False
+    else:
+        print("⚠️  NOTION_DATABASE_ID not set")
+        all_valid = False
+    
+    # Check all updates database
+    if NOTION_ALL_UPDATES_DATABASE_ID:
+        try:
+            print(f"   Checking all updates database: {NOTION_ALL_UPDATES_DATABASE_ID}")
+            response = requests.get(
+                f'{NOTION_API_URL}/databases/{NOTION_ALL_UPDATES_DATABASE_ID}',
+                headers=headers
+            )
+            if response.status_code == 200:
+                db_info = response.json()
+                db_title = db_info.get('title', [{}])[0].get('plain_text', 'Unknown')
+                print(f"✅ All updates database accessible: {db_title}")
+            else:
+                print(f"❌ All updates database not accessible: {response.status_code}")
+                error_data = response.json() if response.text else {}
+                error_msg = error_data.get('message', response.text)
+                print(f"   Error: {error_msg}")
+                print(f"   💡 Troubleshooting steps:")
+                print(f"      1. Open the database in Notion")
+                print(f"      2. Click the '...' menu (top right) → 'Connections'")
+                print(f"      3. Make sure your integration is connected")
+                print(f"      4. If not connected, click 'Add connections' and select your integration")
+                print(f"      5. Verify the database ID from the URL:")
+                print(f"         - URL format: https://www.notion.so/XXXXXXXXXXXXX?v=...")
+                print(f"         - Copy the XXXXXXXXXXXXX part (32 characters, no dashes)")
+                print(f"         - Current ID in .env: {NOTION_ALL_UPDATES_DATABASE_ID}")
+                all_valid = False
+        except Exception as e:
+            print(f"❌ Error checking all updates database: {e}")
+            all_valid = False
+    else:
+        print("⚠️  NOTION_ALL_UPDATES_DATABASE_ID not set")
+        all_valid = False
+    
+    return all_valid
 
 
 def main():
@@ -1995,6 +3428,21 @@ def main():
     if not NOTION_DATABASE_ID:
         print("Error: NOTION_DATABASE_ID not set in .env file")
         return
+    
+    if not NOTION_ALL_UPDATES_DATABASE_ID:
+        print("Error: NOTION_ALL_UPDATES_DATABASE_ID not set in .env file")
+        return
+    
+    # Validate database access
+    print("\n🔍 Validating Notion database access...")
+    if not validate_notion_databases():
+        print("\n❌ Database validation failed. Please check:")
+        print("   1. Database IDs are correct in .env file")
+        print("   2. Databases are shared with your Notion integration")
+        print("   3. Notion integration has proper permissions")
+        print("\n⚠️  Continuing anyway, but webhooks may fail...")
+    else:
+        print("✅ All databases validated successfully!\n")
     
     port = int(os.getenv('PORT', 8000))
     
@@ -2029,9 +3477,13 @@ def main():
         print("Starting Linear to Notion webhook server...")
         print(f"Local webhook endpoint: http://localhost:{port}/webhook")
         print(f"Local health check: http://localhost:{port}/health")
+        print(f"Manual Master Update trigger: http://localhost:{port}/generate-master-update (POST)")
         if not USE_NGROK:
             print("\n💡 To test with Linear webhooks locally, set USE_NGROK=true in .env")
             print("   and optionally set NGROK_AUTH_TOKEN for authenticated ngrok sessions\n")
+    
+    # Start cron job scheduler
+    start_cron_job()
     
     # Run Flask app
     # In production, use a proper WSGI server like gunicorn

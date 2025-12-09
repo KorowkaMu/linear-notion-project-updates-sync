@@ -27,7 +27,27 @@ This project syncs Linear Project Updates to Notion pages using webhooks. When a
 4. Configure your credentials in `.env`:
    - `LINEAR_API_KEY`: Your Linear API key (needed to fetch team names)
    - `NOTION_API_KEY`: Your Notion integration token
-   - `NOTION_DATABASE_ID`: The Notion database ID where updates should be posted
+   - `NOTION_DATABASE_ID`: The Notion database ID where Master Project Updates should be posted
+   - `NOTION_ALL_UPDATES_DATABASE_ID`: The Notion database ID for "All project updates" (where individual updates are collected)
+
+5. **Configure Notion Integration Database Access**:
+   
+   Your Notion integration needs access to both databases. To configure this:
+   
+   - Open your Notion workspace settings
+   - Go to **Connections**
+   - Click **"Develop or manage integrations"** (or go directly to [https://www.notion.so/profile/integrations](https://www.notion.so/profile/integrations))
+   - Find your integration in the list
+   - Click **"Edit settings"**
+   - Select the **"Access"** tab
+   - Click **"Edit access"** link
+   - Select your team space
+   - Check the databases that need to be shared:
+     - The database specified in `NOTION_DATABASE_ID` (for Master Project Updates)
+     - The database specified in `NOTION_ALL_UPDATES_DATABASE_ID` (for All project updates)
+   - Click **"Save"**
+   
+   ⚠️ **Important**: Both databases must be explicitly granted access in the integration settings. Simply sharing the database with your user account is not sufficient.
 
 ## Local Testing with ngrok
 
@@ -89,7 +109,8 @@ For production, deploy to a hosting service (Heroku, Railway, Render, etc.) and:
 
 - `LINEAR_API_KEY`: Your Linear API key (for fetching team information)
 - `NOTION_API_KEY`: Your Notion integration token
-- `NOTION_DATABASE_ID`: The Notion database ID where updates should be posted
+- `NOTION_DATABASE_ID`: The Notion database ID where Master Project Updates should be posted
+- `NOTION_ALL_UPDATES_DATABASE_ID`: The Notion database ID for "All project updates" (where individual updates are collected before being aggregated into Master Updates)
 
 ### Optional Environment Variables
 
@@ -119,4 +140,9 @@ For production, deploy to a hosting service (Heroku, Railway, Render, etc.) and:
 
 - **ngrok not working**: Make sure `pyngrok` is installed: `pip install pyngrok`
 - **Webhook not receiving events**: Check that the URL in Linear matches your ngrok URL
-- **Notion errors**: Verify your `NOTION_API_KEY` and `NOTION_DATABASE_ID` are correct, and that your Notion integration has access to the database
+- **Notion database access errors (404)**: 
+  - Verify your database IDs are correct in `.env`
+  - Make sure both databases are granted access in your Notion integration settings (see step 5 in Setup)
+  - Database IDs should be 32 characters (without dashes) - they're automatically formatted
+  - You can test database access using: `GET http://localhost:8000/test-database/YOUR_DATABASE_ID`
+- **Notion errors**: Verify your `NOTION_API_KEY` and database IDs are correct, and that your Notion integration has access to both databases
