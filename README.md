@@ -4,7 +4,7 @@ Automate posting Linear Project Updates to Notion pages via webhooks.
 
 ## Overview
 
-This project syncs Linear Project Updates to Notion pages using webhooks. When a project update is created in Linear, it automatically creates or updates a daily Notion document with the format: `{{team}}. Update @.{{YYYY-MM-DD}}`. Each update is added as a separate block with the project name as a heading.
+This project syncs Linear Project Updates to Notion pages using webhooks. When a project update is created in Linear, it automatically creates or updates a a record in the "All project updates" db in Notion. There is also a scheduler that runs every 2 hours Friday - Monday, fetchesh all the updates for the week from "All project updates" db, assembles them into a single "Project Updates" doc and post to Company Updates Database.
 
 ## Setup
 
