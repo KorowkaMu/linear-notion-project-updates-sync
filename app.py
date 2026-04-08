@@ -703,6 +703,40 @@ if PYDANTIC_AVAILABLE and BaseModel is not None:
         blocks: List[NotionBlock]  # type: ignore
 
 
+def validate_and_normalize_link(link_val):
+    """
+    Validate and normalize a link value to ensure it's in the correct Notion format.
+    
+    Args:
+        link_val: Can be a string (URL), dict with 'url' key, or invalid format
+        
+    Returns:
+        dict with 'url' key if valid, None if invalid
+    """
+    if not link_val:
+        return None
+    
+    # If it's already a dict with 'url' key
+    if isinstance(link_val, dict):
+        url = link_val.get('url')
+        if url and isinstance(url, str) and url.strip():
+            # Basic URL validation - must start with http:// or https://
+            url = url.strip()
+            if url.startswith('http://') or url.startswith('https://'):
+                return {'url': url}
+        return None
+    
+    # If it's a string, convert to dict format
+    if isinstance(link_val, str):
+        url = link_val.strip()
+        if url and (url.startswith('http://') or url.startswith('https://')):
+            return {'url': url}
+        return None
+    
+    # Invalid format
+    return None
+
+
 def convert_content_with_llm(update_body):
     """
     Use OpenAI LLM to convert Linear project update content into Notion-compatible format.
@@ -816,7 +850,7 @@ Guidelines:
 
 - Place Linear URLs inline within paragraph blocks, not as separate embed blocks.
 
-- Use "embed" blocks for video URLs (Loom, YouTube, Vimeo, etc.) in the same way:
+- Use "embed" blocks for video URLs (Loom, YouTube, Vimeo, etc.):
   {{
     "object": "block",
     "type": "embed",
@@ -824,8 +858,44 @@ Guidelines:
       "url": "https://..."
     }}
   }}
+  NOTE: Embed blocks are separate from inline links. They do NOT use rich_text or link annotations.
 
-- For other inline links in text, use rich_text with link annotations.
+- For other inline links in text (non-video URLs), use rich_text with link annotations.
+
+- CRITICAL LINK FORMATTING RULES (ONLY applies to inline links in rich_text, NOT embed blocks):
+  * These rules apply ONLY to links inside rich_text arrays (paragraphs, headings, list items)
+  * Embed blocks have their own structure and are NOT affected by these rules
+  * Links MUST be placed INSIDE the "text" object, NOT at the top level of rich_text items
+  * The link structure MUST be: {{"link": {{"url": "https://..."}}}}
+  * The "url" field MUST be a string that starts with "http://" or "https://"
+  * The "url" field MUST NOT be empty, null, or missing
+  * CORRECT format for inline links (inside rich_text item):
+    {{
+      "type": "text",
+      "text": {{
+        "content": "Click here",
+        "link": {{
+          "url": "https://www.example.com"
+        }}
+      }}
+    }}
+  * CORRECT format for embed blocks (separate block type):
+    {{
+      "object": "block",
+      "type": "embed",
+      "embed": {{
+        "url": "https://www.loom.com/share/..."
+      }}
+    }}
+  * INCORRECT formats for inline links (DO NOT USE):
+    - Top-level link: {{"type": "text", "text": {{"content": "text"}}, "link": {{"url": "..."}}}} ❌
+    - String URL: {{"type": "text", "text": {{"content": "text", "link": "https://..."}}}} ❌
+    - Missing url key: {{"type": "text", "text": {{"content": "text", "link": {{}}}}}} ❌
+    - Empty URL: {{"type": "text", "text": {{"content": "text", "link": {{"url": ""}}}}}} ❌
+    - Invalid URL format: {{"type": "text", "text": {{"content": "text", "link": {{"url": "not-a-url"}}}}}} ❌
+  * If a URL is invalid or malformed, include it as plain text WITHOUT a link annotation
+  * Always validate that URLs start with "http://" or "https://" before creating link annotations
+  * REMEMBER: Embed blocks (for videos) use a completely different structure and are NOT subject to these inline link rules
 
 - CRITICAL: All text content (paragraphs, headings, list items) MUST use "rich_text" array format. NEVER use a "text" field directly in block structures.
 
@@ -892,11 +962,30 @@ Content to convert:
                     if "embed" not in block_dict:
                         url = block_dict.get("url")
                         if url:
-                            block_dict["embed"] = {"url": url}
+                            normalized_link = validate_and_normalize_link(url)
+                            if normalized_link:
+                                block_dict["embed"] = normalized_link
+                            else:
+                                print(f"   ⚠️  Invalid embed URL, skipping embed block: {url}")
+                                continue  # Skip this block
                             block_dict.pop("url", None)
                     # Case 2: model returned "embed": "https://linear.app/..."
                     elif isinstance(block_dict["embed"], str):
-                        block_dict["embed"] = {"url": block_dict["embed"]}
+                        normalized_link = validate_and_normalize_link(block_dict["embed"])
+                        if normalized_link:
+                            block_dict["embed"] = normalized_link
+                        else:
+                            print(f"   ⚠️  Invalid embed URL, skipping embed block: {block_dict['embed']}")
+                            continue  # Skip this block
+                    # Case 3: model returned "embed": {"url": "..."} - validate it
+                    elif isinstance(block_dict["embed"], dict):
+                        url = block_dict["embed"].get("url")
+                        normalized_link = validate_and_normalize_link(url) if url else None
+                        if normalized_link:
+                            block_dict["embed"] = normalized_link
+                        else:
+                            print(f"   ⚠️  Invalid embed URL, skipping embed block: {url}")
+                            continue  # Skip this block
                 
                 # Ensure paragraph blocks have the correct Notion shape
                 if block_dict["type"] == "paragraph":
@@ -936,8 +1025,12 @@ Content to convert:
                                 # NEW: always move top-level "link" into text.link, if possible
                                 if "link" in rt_item:
                                     link_val = rt_item.pop("link")
-                                    if isinstance(rt_item.get("text"), dict):
-                                        rt_item["text"]["link"] = link_val
+                                    normalized_link = validate_and_normalize_link(link_val)
+                                    if normalized_link and isinstance(rt_item.get("text"), dict):
+                                        rt_item["text"]["link"] = normalized_link
+                                    elif link_val:
+                                        # Link was invalid, log a warning
+                                        print(f"   ⚠️  Invalid link format in paragraph block, removing: {link_val}")
                                 
                                 # Ensure type is set
                                 if "type" not in rt_item:
@@ -992,8 +1085,12 @@ Content to convert:
                                 # NEW: move top-level link into text.link
                                 if "link" in rt_item:
                                     link_val = rt_item.pop("link")
-                                    if isinstance(rt_item.get("text"), dict):
-                                        rt_item["text"]["link"] = link_val
+                                    normalized_link = validate_and_normalize_link(link_val)
+                                    if normalized_link and isinstance(rt_item.get("text"), dict):
+                                        rt_item["text"]["link"] = normalized_link
+                                    elif link_val:
+                                        # Link was invalid, log a warning
+                                        print(f"   ⚠️  Invalid link format in heading block, removing: {link_val}")
                                 
                                 if "type" not in rt_item:
                                     rt_item["type"] = "text"
@@ -1041,8 +1138,12 @@ Content to convert:
                                 # NEW: move top-level link into text.link
                                 if "link" in rt_item:
                                     link_val = rt_item.pop("link")
-                                    if isinstance(rt_item.get("text"), dict):
-                                        rt_item["text"]["link"] = link_val
+                                    normalized_link = validate_and_normalize_link(link_val)
+                                    if normalized_link and isinstance(rt_item.get("text"), dict):
+                                        rt_item["text"]["link"] = normalized_link
+                                    elif link_val:
+                                        # Link was invalid, log a warning
+                                        print(f"   ⚠️  Invalid link format in list item block, removing: {link_val}")
                                 
                                 if "type" not in rt_item:
                                     rt_item["type"] = "text"
@@ -1133,15 +1234,24 @@ def convert_content_with_fallback(update_body):
         # Add the URL as a link
         # Extract link text (could be the URL itself or text before it)
         link_text = url
-        rich_text.append({
-            'type': 'text',
-            'text': {
-                'content': link_text,
-                'link': {
-                    'url': url
+        normalized_link = validate_and_normalize_link(url)
+        if normalized_link:
+            rich_text.append({
+                'type': 'text',
+                'text': {
+                    'content': link_text,
+                    'link': normalized_link
                 }
-            }
-        })
+            })
+        else:
+            # Invalid URL, add as plain text instead
+            print(f"   ⚠️  Invalid URL in fallback, adding as plain text: {url}")
+            rich_text.append({
+                'type': 'text',
+                'text': {
+                    'content': link_text
+                }
+            })
         last_end = end
     
     # Add remaining text after the last URL
@@ -1429,7 +1539,11 @@ def add_project_update_block(page_id, project_name, update_body, project_url=Non
         }
     }
     if project_url:
-        project_name_text['text']['link'] = {'url': project_url}
+        normalized_link = validate_and_normalize_link(project_url)
+        if normalized_link:
+            project_name_text['text']['link'] = normalized_link
+        else:
+            print(f"   ⚠️  Invalid project URL format, skipping link: {project_url}")
     heading_parts.append(project_name_text)
     
     # Start with a divider line before the heading for reliable deduplication
@@ -1738,6 +1852,52 @@ def get_database_title_property(database_id):
             # If no title property found, return None
             return None
         else:
+            return None
+    except Exception as e:
+        print(f"   ⚠️  Error fetching database schema: {e}")
+        return None
+
+
+def get_database_property_by_type(database_id, property_type):
+    """
+    Get a property name from a Notion database by its type.
+    Returns the property name, or None if not found.
+    
+    Args:
+        database_id: The Notion database ID
+        property_type: The type of property to find (e.g., 'title', 'date')
+    
+    Returns:
+        The property name, or None if not found
+    """
+    if not NOTION_API_KEY:
+        return None
+    
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+    }
+    
+    try:
+        response = requests.get(
+            f'{NOTION_API_URL}/databases/{database_id}',
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            db_info = response.json()
+            properties = db_info.get('properties', {})
+            
+            # Find the property with the specified type
+            for prop_name, prop_data in properties.items():
+                if prop_data.get('type') == property_type:
+                    return prop_name
+            
+            # If no property found, return None
+            return None
+        else:
+            print(f"   ⚠️  Error fetching database schema: {response.status_code}")
             return None
     except Exception as e:
         print(f"   ⚠️  Error fetching database schema: {e}")
@@ -2231,6 +2391,24 @@ def generate_master_update(updates, week_ending_date):
     # Build Master Update blocks
     master_blocks = []
     
+    master_blocks.append({
+        'object': 'block',
+        'type': 'callout',
+        'callout': {
+            'rich_text': [{
+                'type': 'text',
+                'text': {
+                    'content': 'This document is automatically generated and should not be edited. Any manual changes will be overwritten.'
+                }
+            }],
+            'icon': {
+                'type': 'emoji',
+                'emoji': '⚠️'
+            },
+            'color': 'yellow_background'
+        }
+    })
+    
     # Add team sections
     for team_name in sorted(single_team_updates.keys()):
         # Add team heading
@@ -2297,30 +2475,49 @@ def find_or_replace_master_update(week_ending_date, master_blocks):
         'Notion-Version': '2022-06-28',
     }
     
+    # Get property names from database schema
+    title_property = get_database_property_by_type(NOTION_DATABASE_ID, 'title')
+    date_property = get_database_property_by_type(NOTION_DATABASE_ID, 'date')
+    
+    if not title_property:
+        print("   ❌ Error: Could not find title property in Master Update database")
+        print("   💡 Please check your database schema and ensure it has a title property")
+        return False
+    
+    if not date_property:
+        print("   ⚠️  Warning: Could not find date property in Master Update database")
+        print("   💡 Will try to create document without date property filter")
+        date_property = None
+    
     document_title = "Project Updates"
     
     # Try to find existing document
     query_url = f'{NOTION_API_URL}/databases/{NOTION_DATABASE_ID}/query'
+    
+    # Build filter based on available properties
+    filter_conditions = [
+        {
+            'property': title_property,
+            'title': {
+                'equals': document_title
+            }
+        }
+    ]
+    
+    if date_property:
+        filter_conditions.append({
+            'property': date_property,
+            'date': {
+                'equals': week_ending_date
+            }
+        })
     
     try:
         query_response = requests.post(
             query_url,
             json={
                 'filter': {
-                    'and': [
-                        {
-                            'property': 'Name',
-                            'title': {
-                                'equals': document_title
-                            }
-                        },
-                        {
-                            'property': 'Week ending on',
-                            'date': {
-                                'equals': week_ending_date
-                            }
-                        }
-                    ]
+                    'and': filter_conditions
                 },
                 'page_size': 1
             },
@@ -2386,28 +2583,38 @@ def find_or_replace_master_update(week_ending_date, master_blocks):
         # Create new document if not found
         if not page_id:
             print("   📝 Creating new Master Update document...")
+            print(f"   📋 Using title property: '{title_property}'")
+            if date_property:
+                print(f"   📋 Using date property: '{date_property}'")
+            
+            # Build properties object
+            properties = {
+                title_property: {
+                    'title': [
+                        {
+                            'text': {
+                                'content': document_title
+                            }
+                        }
+                    ]
+                }
+            }
+            
+            # Add date property if it exists
+            if date_property:
+                properties[date_property] = {  # type: ignore
+                    'date': {
+                        'start': week_ending_date
+                    }
+                }
+            
             page_data = {
                 'parent': {'database_id': NOTION_DATABASE_ID},
                 'icon': {
                     'type': 'emoji',
                     'emoji': '👷'
                 },
-                'properties': {
-                    'Name': {
-                        'title': [
-                            {
-                                'text': {
-                                    'content': document_title
-                                }
-                            }
-                        ]
-                    },
-                    'Week ending on': {
-                        'date': {
-                            'start': week_ending_date
-                        }
-                    }
-                }
+                'properties': properties
             }
             
             create_response = requests.post(
@@ -2527,11 +2734,15 @@ def verify_linear_signature(request):
         return False
     
     print(f"   Received signature: {signature[:20]}...")
+    print(f"   Secret configured: {'Yes' if LINEAR_WEBHOOK_SECRET else 'No'} (length: {len(LINEAR_WEBHOOK_SECRET) if LINEAR_WEBHOOK_SECRET else 0})")
     
     # Compute HMAC-SHA256 signature of the raw request body
     # Important: Use request.data (raw bytes) not request.get_json() which parses it
     raw_body = request.data
     print(f"   Raw body length: {len(raw_body)} bytes")
+    
+    if not raw_body:
+        print("   ⚠️  Warning: Request body is empty, signature verification may fail")
     
     computed_signature = hmac.new(
         LINEAR_WEBHOOK_SECRET.encode('utf-8'),
@@ -2545,6 +2756,10 @@ def verify_linear_signature(request):
     is_valid = hmac.compare_digest(computed_signature, signature)
     if not is_valid:
         print("❌ Signature mismatch!")
+        print("   💡 Troubleshooting:")
+        print("     1. Verify LINEAR_WEBHOOK_SECRET in .env matches the secret in Linear webhook settings")
+        print("     2. Check that the webhook secret hasn't been regenerated in Linear")
+        print("     3. Ensure request body hasn't been modified (e.g., by proxy/ngrok)")
     return is_valid
 
 
@@ -3260,8 +3475,9 @@ def is_friday_to_monday():
     Check if current day is Friday, Saturday, Sunday, or Monday (in UTC).
     Returns True if it's one of these days, False otherwise.
     """
-    # Get current UTC time
-    now_utc = datetime.utcnow()
+    # Get current UTC time (using timezone-aware datetime)
+    from datetime import timezone
+    now_utc = datetime.now(timezone.utc)
     # Get day of week (Monday=0, Sunday=6)
     day_of_week = now_utc.weekday()
     
@@ -3320,11 +3536,13 @@ def cron_job_worker():
     
     def job():
         """Job to run - only execute if it's Friday-Monday"""
+        from datetime import timezone
         if is_friday_to_monday():
             print("\n⏰ Cron job triggered (Friday-Monday)")
             run_master_update_with_retries()
         else:
-            print(f"⏰ Cron job skipped (not Friday-Monday, current day: {datetime.utcnow().strftime('%A')})")
+            current_day = datetime.now(timezone.utc).strftime('%A')
+            print(f"⏰ Cron job skipped (not Friday-Monday, current day: {current_day})")
     
     # Schedule job to run every 2 hours
     schedule.every(2).hours.do(job)  # type: ignore
